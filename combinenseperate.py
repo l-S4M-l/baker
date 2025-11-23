@@ -21,6 +21,23 @@ VERTEX_GROUP_SPLITTER = "::;::"
 DEBUG = True
 bake_queue = []
 is_baking = False
+group_bake_queue = []
+group_bake_active = False
+
+def _process_group_queue():
+    global group_bake_active
+
+    if group_bake_active:
+        return 0.2
+
+    if len(group_bake_queue) == 0:
+        return None
+
+    next_group = group_bake_queue.pop(0)
+    group_item, resolution, callback = next_group
+    group_bake_active = True
+    bake_group_item(group_item, resolution, callback)
+    return 0.2
 
 def _process_bake_queue():
     global is_baking
@@ -199,9 +216,11 @@ class LightmapBaker:
 
 def bake_lightmap_async(obj, lightmap_group, resolution=2048, callback=None):
     bake_queue.append((obj, lightmap_group, resolution, callback))
-    bpy.app.timers.register(_process_bake_queue, first_interval=0.01)
+    if not bpy.app.timers.is_registered(_process_bake_queue):
+        bpy.app.timers.register(_process_bake_queue, first_interval=0.01)
 
 def bake_group_item(group_item, resolution, callback):
+    global group_bake_active
     # 1. collect objects
     object_list = []
     index = 0
@@ -209,35 +228,66 @@ def bake_group_item(group_item, resolution, callback):
     for objects in group_item.objects:
         object_list.append(objects.obj)
 
-    combined_object = combine(object_list)
+    if len(object_list) == 0:
+        group_bake_active = False
 
-    # 3. ensure LightMap UV
-    lightmap_uv = ensure_lightmap_uv(combined_object)
+        if not bpy.app.timers.is_registered(_process_group_queue):
+            bpy.app.timers.register(_process_group_queue, first_interval=0.05)
+        return
 
-    # 4. smart unwrap
-    smart_uv_unwrap(combined_object)
+    try:
+        combined_object = combine(object_list)
 
-    # 5. bake using your queue-based async system
-    # NOTE: we patch callback so it also handles emission + separation
-    def group_callback(image, lightmap_group):
-        # assign baked LM to emission
-        print("ok")
+        lightmap_uv = ensure_lightmap_uv(combined_object)
+        lightmap_uv.active = True
+        lightmap_uv.active_render = True
 
-        assign_lightmap_to_materials(combined_object, image)
+        smart_uv_unwrap(combined_object)
 
-        # seperate back into original objects
-        seperate(combined_object)
+        def group_callback(image, lightmap_group):
+            print("ok")
 
-        # run user callback (saving etc)
-        if callback is not None:
-            callback(image, lightmap_group)
+            assign_lightmap_to_materials(combined_object, image)
 
-    bake_lightmap_async(
-        combined_object,
-        group_item.name,
-        resolution=resolution,
-        callback=group_callback
-    )
+            make_object_active_and_selected(combined_object)
+            seperate(combined_object)
+
+            if callback is not None:
+                callback(image, lightmap_group)
+
+            group_bake_active = False
+
+            if not bpy.app.timers.is_registered(_process_group_queue):
+                bpy.app.timers.register(_process_group_queue, first_interval=0.05)
+
+        bake_lightmap_async(
+            combined_object,
+            group_item.name,
+            resolution=resolution,
+            callback=group_callback
+        )
+    except Exception as exc:
+        group_bake_active = False
+        print("Group bake failed:", exc)
+
+        if not bpy.app.timers.is_registered(_process_group_queue):
+            bpy.app.timers.register(_process_group_queue, first_interval=0.05)
+
+def queue_group_bakes(group_items, resolution, callback):
+    global group_bake_active
+    if not group_bake_active:
+        while len(group_bake_queue) > 0:
+            group_bake_queue.pop(0)
+
+    index = 0
+
+    while index < len(group_items):
+        entry = group_items[index]
+        group_bake_queue.append((entry, resolution, callback))
+        index += 1
+
+    if not bpy.app.timers.is_registered(_process_group_queue):
+        bpy.app.timers.register(_process_group_queue, first_interval=0.01)
 
 def ensure_lightmap_uv(mesh_object):
     mesh_data = mesh_object.data
@@ -578,30 +628,23 @@ class LGX_bake_lightmap(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
-        group_index = 0
+        def save_lightmap(img, lightmap_group):
 
-        while group_index < len(scene.my_items):
-            group_item = scene.my_items[group_index]
+            base_path = bpy.path.abspath(context.scene.lgx_bake_settings.LGX_bake_output_folder)
 
-            def save_lightmap(img, lightmap_group):
 
-                base_path = bpy.path.abspath(context.scene.lgx_bake_settings.LGX_bake_output_folder)
-                
-                
-                path = os.path.join(base_path, f"lightmap_{lightmap_group}.png")
-                
-                img.filepath_raw = path
-                img.file_format = 'PNG'
-                img.save()
-                print("Saved lightmap to:", path)
+            path = os.path.join(base_path, f"lightmap_{lightmap_group}.png")
 
-            bake_group_item(
-                group_item,
-                resolution=2048,
-                callback=save_lightmap
-            )
+            img.filepath_raw = path
+            img.file_format = 'PNG'
+            img.save()
+            print("Saved lightmap to:", path)
 
-            group_index += 1
+        queue_group_bakes(
+            scene.my_items,
+            resolution=2048,
+            callback=save_lightmap
+        )
 
         return {'FINISHED'}
 
