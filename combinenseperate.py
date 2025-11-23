@@ -60,7 +60,11 @@ def _process_group_queue():
                 combined_object = combine(job_entry.get("objects"))
                 job_entry["combined_object"] = combined_object
 
-                prepare_lightmap_uv(combined_object)
+                lightmap_uv = ensure_lightmap_uv(combined_object)
+                lightmap_uv.active = True
+                lightmap_uv.active_render = True
+
+                smart_uv_unwrap(combined_object)
             except Exception as exc:
                 print("Group combine failed:", exc)
             group_bake_active = False
@@ -354,7 +358,11 @@ def bake_group_item(group_item, resolution, callback):
     try:
         combined_object = combine(object_list)
 
-        prepare_lightmap_uv(combined_object)
+        lightmap_uv = ensure_lightmap_uv(combined_object)
+        lightmap_uv.active = True
+        lightmap_uv.active_render = True
+
+        smart_uv_unwrap(combined_object)
 
         def group_callback(image, lightmap_group):
             print("ok")
