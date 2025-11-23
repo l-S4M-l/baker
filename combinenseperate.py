@@ -62,7 +62,7 @@ def _process_group_queue():
 
                 lightmap_uv = ensure_lightmap_uv(combined_object)
                 lightmap_uv.active = True
-                lightmap_uv.active_render = True
+                lightmap_uv.active_render = False
 
                 smart_uv_unwrap(combined_object)
             except Exception as exc:
@@ -360,7 +360,7 @@ def bake_group_item(group_item, resolution, callback):
 
         lightmap_uv = ensure_lightmap_uv(combined_object)
         lightmap_uv.active = True
-        lightmap_uv.active_render = True
+        lightmap_uv.active_render = False
 
         smart_uv_unwrap(combined_object)
 
