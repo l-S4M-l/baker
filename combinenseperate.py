@@ -23,20 +23,140 @@ bake_queue = []
 is_baking = False
 group_bake_queue = []
 group_bake_active = False
+group_pipeline_stage = "idle"
+group_pipeline_index = 0
+group_pipeline_jobs = []
 
 def _process_group_queue():
     global group_bake_active
+    global group_pipeline_stage
+    global group_pipeline_index
+    global group_pipeline_jobs
 
     if group_bake_active:
         return 0.2
 
-    if len(group_bake_queue) == 0:
+    if len(group_pipeline_jobs) == 0:
+        group_pipeline_stage = "idle"
+        group_pipeline_index = 0
         return None
 
-    next_group = group_bake_queue.pop(0)
-    group_item, resolution, callback = next_group
-    group_bake_active = True
-    bake_group_item(group_item, resolution, callback)
+    if group_pipeline_stage == "combine":
+        if group_pipeline_index >= len(group_pipeline_jobs):
+            group_pipeline_stage = "bake"
+            group_pipeline_index = 0
+            return 0.05
+
+        job_entry = group_pipeline_jobs[group_pipeline_index]
+        if job_entry.get("combined_object") is not None:
+            group_pipeline_index += 1
+            return 0.05
+
+        group_bake_active = True
+
+        def _do_combine():
+            global group_bake_active
+            try:
+                combined_object = combine(job_entry.get("objects"))
+                job_entry["combined_object"] = combined_object
+
+                lightmap_uv = ensure_lightmap_uv(combined_object)
+                lightmap_uv.active = True
+                lightmap_uv.active_render = True
+
+                smart_uv_unwrap(combined_object)
+            except Exception as exc:
+                print("Group combine failed:", exc)
+            group_bake_active = False
+            return None
+
+        bpy.app.timers.register(_do_combine, first_interval=0.01)
+        return 0.2
+
+    if group_pipeline_stage == "bake":
+        if group_pipeline_index >= len(group_pipeline_jobs):
+            group_pipeline_stage = "separate"
+            group_pipeline_index = 0
+            return 0.05
+
+        job_entry = group_pipeline_jobs[group_pipeline_index]
+        combined_object = job_entry.get("combined_object")
+
+        if combined_object is None:
+            group_pipeline_index += 1
+            return 0.05
+
+        if job_entry.get("baked") is True:
+            group_pipeline_index += 1
+            return 0.05
+
+        if job_entry.get("bake_started") is True:
+            return 0.2
+
+        group_bake_active = True
+
+        def group_callback(image, lightmap_group):
+            global group_bake_active
+            try:
+                assign_lightmap_to_materials(combined_object, image)
+
+                if job_entry.get("callback") is not None:
+                    job_entry.get("callback")(image, lightmap_group)
+            except Exception as exc:
+                print("Group bake callback failed:", exc)
+            job_entry["baked"] = True
+            job_entry["baked_image"] = image
+            group_bake_active = False
+
+            if not bpy.app.timers.is_registered(_process_group_queue):
+                bpy.app.timers.register(_process_group_queue, first_interval=0.05)
+
+        job_entry["bake_started"] = True
+        bake_lightmap_async(
+            combined_object,
+            job_entry.get("group_item").name,
+            resolution=job_entry.get("resolution"),
+            callback=group_callback
+        )
+
+        return 0.2
+
+    if group_pipeline_stage == "separate":
+        if group_pipeline_index >= len(group_pipeline_jobs):
+            group_pipeline_stage = "idle"
+            group_pipeline_index = 0
+            group_pipeline_jobs.clear()
+            group_bake_queue.clear()
+            return None
+
+        job_entry = group_pipeline_jobs[group_pipeline_index]
+        combined_object = job_entry.get("combined_object")
+
+        if job_entry.get("separated") is True:
+            group_pipeline_index += 1
+            return 0.05
+
+        if combined_object is None:
+            job_entry["separated"] = True
+            group_pipeline_index += 1
+            return 0.05
+
+        group_bake_active = True
+
+        def _do_separate():
+            global group_bake_active
+            try:
+                make_object_active_and_selected(combined_object)
+                seperate(combined_object)
+            except Exception as exc:
+                print("Group separation failed:", exc)
+            job_entry["separated"] = True
+            group_bake_active = False
+            return None
+
+        bpy.app.timers.register(_do_separate, first_interval=0.01)
+        return 0.2
+
     return 0.2
 
 def _process_bake_queue():
@@ -274,17 +394,47 @@ def bake_group_item(group_item, resolution, callback):
             bpy.app.timers.register(_process_group_queue, first_interval=0.05)
 
 def queue_group_bakes(group_items, resolution, callback):
+    global group_pipeline_stage
+    global group_pipeline_index
+    global group_pipeline_jobs
     global group_bake_active
-    if not group_bake_active:
-        while len(group_bake_queue) > 0:
-            group_bake_queue.pop(0)
+
+    group_pipeline_jobs.clear()
+    group_bake_queue.clear()
 
     index = 0
 
     while index < len(group_items):
         entry = group_items[index]
-        group_bake_queue.append((entry, resolution, callback))
+        object_list = []
+        object_index = 0
+
+        while object_index < len(entry.objects):
+            object_list.append(entry.objects[object_index].obj)
+            object_index += 1
+
+        if len(object_list) > 0:
+            job_entry = {
+                "group_item": entry,
+                "objects": object_list,
+                "resolution": resolution,
+                "callback": callback,
+                "combined_object": None,
+                "bake_started": False,
+                "baked": False,
+                "separated": False,
+            }
+            group_pipeline_jobs.append(job_entry)
+
         index += 1
+
+    group_pipeline_stage = "combine"
+    group_pipeline_index = 0
+    group_bake_active = False
+
+    if len(group_pipeline_jobs) == 0:
+        group_pipeline_stage = "idle"
+        return
 
     if not bpy.app.timers.is_registered(_process_group_queue):
         bpy.app.timers.register(_process_group_queue, first_interval=0.01)
