@@ -454,10 +454,26 @@ def ensure_lightmap_uv(mesh_object):
     if uv_layer is None:
         uv_layer = mesh_data.uv_layers.new(name="LightMap")
 
-    mesh_data.uv_layers.active = uv_layer
-    mesh_data.uv_layers.active_index = mesh_data.uv_layers.find("LightMap")
-
     return uv_layer
+
+def prepare_lightmap_uv(mesh_object):
+    mesh_data = mesh_object.data
+
+    current_render = mesh_data.uv_layers.active_render
+    lightmap_uv = ensure_lightmap_uv(mesh_object)
+
+    mesh_data.uv_layers.active = lightmap_uv
+    mesh_data.uv_layers.active_index = mesh_data.uv_layers.find(lightmap_uv.name)
+
+    smart_uv_unwrap(mesh_object)
+
+    if current_render is not None:
+        try:
+            mesh_data.uv_layers.active_render = current_render
+        except Exception:
+            pass
+
+    return lightmap_uv
 
 def smart_uv_unwrap(mesh_object):
     ensure_object_mode_is("OBJECT")
