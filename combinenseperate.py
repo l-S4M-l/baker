@@ -832,6 +832,9 @@ def view3d_override():
     return bpy.context.copy()
 
 
+            
+
+
 ###########
 #   Combine / seperate
 ###########
@@ -1048,7 +1051,79 @@ def preview_object(object: bpy.types.Object, preview=True):
         # Output of MixRGB → BSDF Base Color
         links.new(mix_RGB.outputs["Color"], base_input)
 
+def rebuild_baked_mat_list():
+    all_objects = bpy.context.selectable_objects
+
+    global baked_object
+    baked_object = []
+
+    for obj in all_objects:
+        if obj.type == "MESH":
+
+            mat = obj.active_material
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+
+            bsdf = None
+            for n in nodes:
+                if n.type == "BSDF_PRINCIPLED":
+                    bsdf = n
+                    break
+            
+            emit_input = bsdf.inputs["Emission Color"]
+
+            if emit_input.is_linked:
+                em_link = emit_input.links[0]
+                em_node = em_link.from_socket.node
+
+                if em_node.type == "TEX_IMAGE":
+                    img = em_node.image
+                    filename = os.path.basename(img.filepath)
+
+                    if "lightmap_Lightgroup" in filename:
+                        baked_object.append(obj)
+
+def preview_init_check():
+    rebuild_baked_mat_list()
+    props = bpy.context.scene.lgx_preview_props
+    baked_object:list[bpy.types.Object] = baked_object
+    if len(baked_object) != 0:
+        mat = baked_object[0].active_material
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        bsdf = None
+        for n in nodes:
+            if n.type == "BSDF_PRINCIPLED":
+                bsdf = n
+                break
+
+
+        base_input = bsdf.inputs["Base Color"]
+
+        # If nothing is linked to Base Color, do nothing
+        if not base_input.is_linked:
+            return
+
+        # The current link into BSDF Base Color
+        old_link = base_input.links[0]
+        from_sock = old_link.from_socket
+        linked_node = from_sock.node
+
+
+        if linked_node.type == "MIX_RGB":
+            props.disable_preview_off = False   
+            props.disable_preview_on = True
+        elif linked_node.type == "TEX_IMAGE":
+            props.disable_preview_off = True   
+            props.disable_preview_on = False
     
+    
+    
+    else:
+        props.disable_preview_off = True   
+        props.disable_preview_on = True
+
 
 
 class LGX_PreviewProps(bpy.types.PropertyGroup):
@@ -1210,7 +1285,10 @@ class LGX_OT_preview_on(bpy.types.Operator):
         print(baked_object)
 
         if len(baked_object) == 0:
-            return {"FINISHED"}
+            print("attempting to rebuild baked groups")
+            rebuild_baked_mat_list()
+            if len(baked_object) == 0:
+                return {"FINISHED"}
 
         props = context.scene.lgx_preview_props
         props.disable_preview_off = False   # disable OFF button
@@ -1230,7 +1308,10 @@ class LGX_OT_preview_off(bpy.types.Operator):
         print(baked_object)
 
         if len(baked_object) == 0:
-            return {"FINISHED"}
+            print("attempting to rebuild baked groups")
+            rebuild_baked_mat_list()
+            if len(baked_object) == 0:
+                return {"FINISHED"}
         
         props = context.scene.lgx_preview_props
         props.disable_preview_off = True   # disable OFF button
@@ -1513,6 +1594,7 @@ if DEBUG == True:
     classes.extend(debug_classes)
 
 def register():
+    global baked_object
     for class_type in classes:
         bpy.utils.register_class(class_type)
 
@@ -1522,7 +1604,6 @@ def register():
     bpy.types.Scene.lgx_group_generator_count = bpy.props.PointerProperty(type=LGX_group_generator_count)
     bpy.types.Scene.lgx_render_resolution = bpy.props.PointerProperty(type=LGX_resolution)
     bpy.types.Scene.lgx_preview_props = bpy.props.PointerProperty(type=LGX_PreviewProps)
-
 
 def unregister():
     del bpy.types.Scene.lgx_bake_settings
