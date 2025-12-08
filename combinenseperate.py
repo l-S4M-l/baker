@@ -33,7 +33,7 @@ group_pipeline_jobs = []
 group_pipeline_complete_callback = None
 
 global baked_object
-baked_object = []
+baked_object:list[bpy.types.Object] = []
 
 
 ###########
@@ -1055,7 +1055,7 @@ def rebuild_baked_mat_list():
     all_objects = bpy.context.selectable_objects
 
     global baked_object
-    baked_object = []
+    baked_object.clear()
 
     for obj in all_objects:
         if obj.type == "MESH":
@@ -1085,8 +1085,10 @@ def rebuild_baked_mat_list():
 
 def preview_init_check():
     rebuild_baked_mat_list()
+    global baked_object
+
+
     props = bpy.context.scene.lgx_preview_props
-    baked_object:list[bpy.types.Object] = baked_object
     if len(baked_object) != 0:
         mat = baked_object[0].active_material
         nodes = mat.node_tree.nodes
@@ -1436,6 +1438,72 @@ class LGX_bake_lightmap(bpy.types.Operator):
 
         return {'FINISHED'}
 
+class LGX_remove_lightmaps(bpy.types.Operator):
+    bl_idname = "lgx.remove_lightmap"
+    bl_label = "remove lightmaps"
+
+    def execute(self, context):
+        global baked_object
+        if len(baked_object) == 0:
+            return {'FINISHED'}
+        
+        for obj in baked_object:
+            preview_object(obj, preview=False)
+
+            mat = obj.active_material
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
+            bsdf = None
+            for n in nodes:
+                if n.type == "BSDF_PRINCIPLED":
+                    bsdf = n
+                    break
+
+
+            emit_input = bsdf.inputs["Emission Color"]
+
+            if emit_input.is_linked:
+                em_link = emit_input.links[0]
+                em_node = em_link.from_socket.node
+
+                if em_node.type == "TEX_IMAGE":
+                    img = em_node.image
+                    filename = os.path.basename(img.filepath)
+
+                    if "lightmap_Lightgroup" in filename:
+                        # Remove the emission link first
+                        links.remove(em_link)
+
+                        # Collect nodes to delete
+                        to_delete = set()
+                        stack = [em_node]
+
+                        # Walk backwards through the graph
+                        while stack:
+                            node = stack.pop()
+                            if node in to_delete:
+                                continue
+                            
+                            to_delete.add(node)
+
+                            for inp in node.inputs:
+                                if inp.is_linked:
+                                    prev_node = inp.links[0].from_socket.node
+                                    stack.append(prev_node)
+
+                        # Delete nodes
+                        for node in to_delete:
+                            nodes.remove(node)
+
+                        # Remove orphaned image
+                        if img and img.users == 0:
+                            bpy.data.images.remove(img)
+        
+        bpy.ops.outliner.orphans_purge()
+
+        return {'FINISHED'}
+    
+
 #debug preview
 class LGX_preview_on(bpy.types.Operator):
     bl_idname = "lgx.dbg_preview_on"
@@ -1529,6 +1597,8 @@ class LGX_PT_panel(bpy.types.Panel):
         off_col.enabled = not props.disable_preview_off
         off_col.operator("lgx.preview_off", text="Preview OFF")
 
+        box.operator("lgx.remove_lightmap", text="Reset")
+
 class LGX_PT_debug(bpy.types.Panel):
     bl_label = "Debug"
     bl_idname = "LGX_PT_debug"
@@ -1560,6 +1630,7 @@ class LGX_PT_debug(bpy.types.Panel):
 
 
 classes = [
+    LGX_remove_lightmaps,
     LGX_PreviewProps,
     LGX_OT_preview_on,
     LGX_OT_preview_off,
@@ -1604,6 +1675,8 @@ def register():
     bpy.types.Scene.lgx_group_generator_count = bpy.props.PointerProperty(type=LGX_group_generator_count)
     bpy.types.Scene.lgx_render_resolution = bpy.props.PointerProperty(type=LGX_resolution)
     bpy.types.Scene.lgx_preview_props = bpy.props.PointerProperty(type=LGX_PreviewProps)
+
+    preview_init_check()
 
 def unregister():
     del bpy.types.Scene.lgx_bake_settings
