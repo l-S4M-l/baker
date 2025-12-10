@@ -355,7 +355,7 @@ class LightmapBaker:
         self._remove_targets(targets)
 
     def _bake_combined(self):
-        self._bake("COMBINED", self.img_combined, samples=64)
+        self._bake("COMBINED", self.img_combined, samples=128)
 
     def _bake_albedo(self):
         overrides = []
@@ -751,7 +751,7 @@ def smart_uv_unwrap(mesh_object):
 
     bpy.ops.uv.smart_project(
         angle_limit=math.radians(66),   # 66° like the UI
-        island_margin=0.02,
+        island_margin=0.005,
         area_weight=0.0,
         correct_aspect=True,
         scale_to_bounds=True,
@@ -1126,6 +1126,97 @@ def preview_init_check():
         props.disable_preview_off = True   
         props.disable_preview_on = True
 
+def remove_lightmaps():
+    global baked_object
+    if len(baked_object) == 0:
+        return {'FINISHED'}
+    
+    for obj in baked_object:
+        preview_object(obj, preview=False)
+
+        mat = obj.active_material
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        bsdf = None
+        for n in nodes:
+            if n.type == "BSDF_PRINCIPLED":
+                bsdf = n
+                break
+
+
+        emit_input = bsdf.inputs["Emission Color"]
+
+        if emit_input.is_linked:
+            em_link = emit_input.links[0]
+            em_node = em_link.from_socket.node
+
+            if em_node.type == "TEX_IMAGE":
+                img = em_node.image
+                filename = os.path.basename(img.filepath)
+
+                if "lightmap_Lightgroup" in filename:
+                    # Remove the emission link first
+                    links.remove(em_link)
+
+                    # Collect nodes to delete
+                    to_delete = set()
+                    stack = [em_node]
+
+                    # Walk backwards through the graph
+                    while stack:
+                        node = stack.pop()
+                        if node in to_delete:
+                            continue
+                        
+                        to_delete.add(node)
+
+                        for inp in node.inputs:
+                            if inp.is_linked:
+                                prev_node = inp.links[0].from_socket.node
+                                stack.append(prev_node)
+
+                    # Delete nodes
+                    for node in to_delete:
+                        nodes.remove(node)
+
+                    # Remove orphaned image
+                    if img and img.users == 0:
+                        bpy.data.images.remove(img)
+
+def ensure_unique_material(obj):
+    """
+    If the object's active material is used by other objects,
+    duplicate it and assign the duplicate ONLY to this object.
+    """
+
+    if not obj or not obj.material_slots:
+        return
+
+    mat = obj.active_material
+    if not mat:
+        return
+
+    # Find all objects using this material
+    shared_by = [
+        o for o in bpy.data.objects
+        if o.type == 'MESH'
+        and o.material_slots
+        and any(slot.material == mat for slot in o.material_slots)
+    ]
+
+    # If only this object uses it, nothing to do
+    if len(shared_by) <= 1:
+        return
+
+    # Duplicate material
+    new_mat = mat.copy()
+    new_mat.name = f"{mat.name}_unique_{obj.name}"
+
+    # Assign to this object
+    obj.active_material = new_mat
+
+    print(f"✔ {obj.name} now uses its own material: {new_mat.name}")
+
 
 
 class LGX_PreviewProps(bpy.types.PropertyGroup):
@@ -1367,7 +1458,7 @@ class LGX_OT_lightmap_groups_generator(bpy.types.Operator):
         final_list:list[list[bpy.types.Object]] = []
 
         for object in selectable_objects:
-            if object.type == "MESH":
+            if object.type == "MESH" and len(object.data.polygons) > 0:
                 object_list.append(object)
 
         if len(object_list) <= max_per:
@@ -1417,6 +1508,18 @@ class LGX_bake_lightmap(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
+
+        rebuild_baked_mat_list()
+        remove_lightmaps()
+
+
+        for group in scene.my_items:
+            for ref in group.objects:
+                obj = ref.obj
+                ensure_unique_material(obj)
+
+
+
         def save_lightmap(img, lightmap_group):
 
             base_path = bpy.path.abspath(context.scene.lgx_bake_settings.LGX_bake_output_folder)
@@ -1443,62 +1546,9 @@ class LGX_remove_lightmaps(bpy.types.Operator):
     bl_label = "remove lightmaps"
 
     def execute(self, context):
-        global baked_object
-        if len(baked_object) == 0:
-            return {'FINISHED'}
         
-        for obj in baked_object:
-            preview_object(obj, preview=False)
+        remove_lightmaps()
 
-            mat = obj.active_material
-            nodes = mat.node_tree.nodes
-            links = mat.node_tree.links
-            bsdf = None
-            for n in nodes:
-                if n.type == "BSDF_PRINCIPLED":
-                    bsdf = n
-                    break
-
-
-            emit_input = bsdf.inputs["Emission Color"]
-
-            if emit_input.is_linked:
-                em_link = emit_input.links[0]
-                em_node = em_link.from_socket.node
-
-                if em_node.type == "TEX_IMAGE":
-                    img = em_node.image
-                    filename = os.path.basename(img.filepath)
-
-                    if "lightmap_Lightgroup" in filename:
-                        # Remove the emission link first
-                        links.remove(em_link)
-
-                        # Collect nodes to delete
-                        to_delete = set()
-                        stack = [em_node]
-
-                        # Walk backwards through the graph
-                        while stack:
-                            node = stack.pop()
-                            if node in to_delete:
-                                continue
-                            
-                            to_delete.add(node)
-
-                            for inp in node.inputs:
-                                if inp.is_linked:
-                                    prev_node = inp.links[0].from_socket.node
-                                    stack.append(prev_node)
-
-                        # Delete nodes
-                        for node in to_delete:
-                            nodes.remove(node)
-
-                        # Remove orphaned image
-                        if img and img.users == 0:
-                            bpy.data.images.remove(img)
-        
         bpy.ops.outliner.orphans_purge()
 
         return {'FINISHED'}
