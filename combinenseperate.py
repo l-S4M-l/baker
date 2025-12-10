@@ -390,9 +390,9 @@ class LightmapBaker:
 
     def _bake_mask(self):
         """
-        Bake a pure white emission mask for the current object.
-        Output goes to self.img_mask.
-        Materials restored exactly after bake.
+        Bake a mask:
+        - If BSDF Alpha has a texture → use that alpha directly as mask
+        - If no alpha → pure white mask
         """
 
         overrides = []
@@ -401,51 +401,72 @@ class LightmapBaker:
             nt = mat.node_tree
             links = nt.links
 
-            # Find material output
             out = self._find_output(mat)
             if not out:
                 continue
 
-            # Save all original 'Surface' links
+            # Save original surface links
             orig_links = [(l.from_node, l.from_socket)
                         for l in out.inputs["Surface"].links]
 
-            # Remove old surface links
+            # Remove them
             for l in list(out.inputs["Surface"].links):
                 links.remove(l)
 
-            # Create a white emission node
+            # Find BSDF + alpha
+            bsdf = None
+            for n in nt.nodes:
+                if isinstance(n, bpy.types.ShaderNodeBsdfPrincipled):
+                    bsdf = n
+                    break
+
+            alpha_source = None
+            if bsdf:
+                alpha_input = bsdf.inputs.get("Alpha")
+                if alpha_input and alpha_input.is_linked:
+                    alpha_source = alpha_input.links[0].from_socket
+
+            # ----------------------------------------------------
+            # Build Emission for mask bake
+            # ----------------------------------------------------
             emit = nt.nodes.new("ShaderNodeEmission")
-            emit.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+
+            if alpha_source:
+                # Use alpha directly as the emission color
+                # Alpha socket → Emission.Color
+                links.new(alpha_source, emit.inputs["Color"])
+
+            else:
+                # Pure white mask fallback
+                emit.inputs["Color"].default_value = (1, 1, 1, 1)
+
             emit.inputs["Strength"].default_value = 1.0
 
-            # Connect emission to surface
+            # Connect emission → Surface
             links.new(emit.outputs["Emission"], out.inputs["Surface"])
 
-            # Store for restoration
             overrides.append((mat, out, emit, orig_links))
 
-        # Perform the mask bake
+        # Bake EMIT → img_mask
         self._bake("EMIT", self.img_mask)
 
-        # Restore all materials to original state
+        # Cleanup + restore
         for mat, out, emit, orig_links in overrides:
             nt = mat.node_tree
             links = nt.links
 
-            # Remove the emission link
+            # Remove emission link
             for l in list(out.inputs["Surface"].links):
                 links.remove(l)
 
-            # Restore original links
             for from_node, from_socket in orig_links:
                 links.new(from_socket, out.inputs["Surface"])
 
-            # Delete emission node
+            # Remove temporary emission node
             if emit.name in nt.nodes:
                 nt.nodes.remove(emit)
 
-        print("✔ Mask bake complete.")
+        print("✔ Mask bake complete (direct alpha mask).")
 
     def _divide(self):
         C = np.array(self.img_combined.pixels[:]).reshape(-1, 4)
