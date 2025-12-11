@@ -16,7 +16,7 @@ import sys
 import math
 from math import inf
 from scipy.ndimage import gaussian_filter, binary_erosion
-from PIL import Image
+from PIL import Image, ImageMath
 
 if __name__ != "__main__" and __package__:
     importlib.reload(sys.modules[__name__])
@@ -355,7 +355,10 @@ class LightmapBaker:
         self._remove_targets(targets)
 
     def _bake_combined(self):
-        self._bake("COMBINED", self.img_combined, samples=128)
+        self._bake("COMBINED", self.img_combined, samples=1024)
+
+        albedo = np.array(self.img_combined.pixels[:], dtype=np.float32).reshape(512, 512, 4)
+        _debug_save_image(albedo, "COMBINED")
 
     def _bake_albedo(self):
         overrides = []
@@ -469,14 +472,40 @@ class LightmapBaker:
         print("✔ Mask bake complete (direct alpha mask).")
 
     def _divide(self):
-        C = np.array(self.img_combined.pixels[:]).reshape(-1, 4)
-        A = np.array(self.img_albedo.pixels[:]).reshape(-1, 4)
-        A[:, :3] = np.clip(A[:, :3], 1e-4, 1.0)
-        L = np.zeros_like(C)
-        L[:, :3] = C[:, :3] / A[:, :3]
-        L[:, 3] = 1.0
-        self.img_final.pixels = L.flatten().tolist()
+        """
+        Photoshop-accurate Divide blend mode using pure Pillow operations.
+        Result = clamp(Base / max(Blend, 1), 0–1)
+        """
 
+        w, h = self.img_combined.size
+
+        # ------------------------------------------------------------
+        # Convert Blender float image → Pillow 0–255 array
+        # ------------------------------------------------------------
+        C = (np.array(self.img_combined.pixels[:])
+            .reshape(h, w, 4)[:, :, :3] * 255).astype(np.float32)
+        A = (np.array(self.img_albedo.pixels[:])
+            .reshape(h, w, 4)[:, :, :3] * 255).astype(np.float32)
+
+        # Photoshop: avoid divide by zero by clamping denominator to 1
+        A = np.clip(A, 1.0, 255.0)
+
+        # ------------------------------------------------------------
+        # Photoshop Divide: Base / Blend
+        # ------------------------------------------------------------
+        result = C / A  # float division in 0..1 range
+
+        # Clamp to valid range
+        result = np.clip(result, 0.0, 1.0)
+
+        # Convert to RGBA float16 for Blender
+        rgba = np.ones((h, w, 4), dtype=np.float32)
+        rgba[:, :, :3] = result
+
+        # Store in Blender image
+        self.img_final.pixels = rgba.reshape(-1).tolist()
+
+        # Continue with compositing pipeline
         composite_blurred_mask(self.img_final, self.img_mask)
 
 
@@ -772,7 +801,7 @@ def smart_uv_unwrap(mesh_object):
 
     bpy.ops.uv.smart_project(
         angle_limit=math.radians(66),   # 66° like the UI
-        island_margin=0.005,
+        island_margin=0.001,
         area_weight=0.0,
         correct_aspect=True,
         scale_to_bounds=True,
@@ -875,12 +904,16 @@ def combine(selected_objects, ops=None):
             ensure_object_mode_is('OBJECT')
 
             # Build vertex group name
-            if len(mesh_object.material_slots) > 0 and mesh_object.material_slots[0].material is not None:
-                material_name = mesh_object.material_slots[0].material.name
+            real_mat = mesh_object.active_material
+            if real_mat:
+                material_name = real_mat.name
             else:
                 material_name = "Material"
 
-            vertex_group_name = mesh_object.name + VERTEX_GROUP_SPLITTER + material_name
+            vertex_group_name = f"{mesh_object.name}{VERTEX_GROUP_SPLITTER}{material_name}"
+
+            print(f"VERTEX_GROUP {vertex_group_name}")
+
             vertex_group_reference = mesh_object.vertex_groups.get(vertex_group_name)
             if vertex_group_reference is None:
                 vertex_group_reference = mesh_object.vertex_groups.new(name=vertex_group_name)
@@ -970,7 +1003,14 @@ def seperate(active_object: bpy.types.Object, ops=None):
             new_obj.name = original_object_name
 
             new_obj.data.materials.clear()
+            # First try to find exact match
             mat = bpy.data.materials.get(original_material_name)
+
+            # If not found, try unique variant
+            if mat is None:
+                unique_name = f"{original_material_name}_unique_{original_object_name}"
+                mat = bpy.data.materials.get(unique_name)
+
             if mat:
                 new_obj.data.materials.append(mat)
 
@@ -992,6 +1032,8 @@ def seperate(active_object: bpy.types.Object, ops=None):
 
 def preview_object(object: bpy.types.Object, preview=True):
     mat = object.active_material
+    if not mat:
+        return
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
 
@@ -1082,6 +1124,8 @@ def rebuild_baked_mat_list():
         if obj.type == "MESH":
 
             mat = obj.active_material
+            if not mat:
+                return
             nodes = mat.node_tree.nodes
             links = mat.node_tree.links
 
@@ -1231,7 +1275,6 @@ def ensure_unique_material(obj):
 
     # Duplicate material
     new_mat = mat.copy()
-    new_mat.name = f"{mat.name}_unique_{obj.name}"
 
     # Assign to this object
     obj.active_material = new_mat
@@ -1600,6 +1643,20 @@ class LGX_preview_off(bpy.types.Operator):
 
         return {'FINISHED'}
 
+class LGX_ensure_unique(bpy.types.Operator):
+    bl_idname = "lgx.ensure_unique"
+    bl_label = "uwu"
+    def execute(self, context):
+        objects:list[bpy.types.Object] = bpy.context.selected_objects
+
+
+        for obj in objects:
+            ensure_unique_material(obj)
+            
+            print(obj.active_material.name)
+
+        return {"FINISHED"}
+
 #panels
 class LGX_PT_panel(bpy.types.Panel):
     bl_label = "LumaxGL"
@@ -1690,6 +1747,7 @@ class LGX_PT_debug(bpy.types.Panel):
 
         layout.label(text=f"render res = {context.scene.lgx_render_resolution.value}")
 
+        layout.operator("lgx.ensure_unique", text = "unique")
         box = layout.box()
 
         box.label(text="preview_objects")
@@ -1701,6 +1759,7 @@ class LGX_PT_debug(bpy.types.Panel):
 
 
 classes = [
+    LGX_ensure_unique,
     LGX_remove_lightmaps,
     LGX_PreviewProps,
     LGX_OT_preview_on,
