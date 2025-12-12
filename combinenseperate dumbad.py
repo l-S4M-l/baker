@@ -15,14 +15,19 @@ import importlib
 import sys
 import math
 from math import inf
+
+# Ensure user site-packages is in path for scipy
+_user_site_packages = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "Python", f"Python{sys.version_info.major}{sys.version_info.minor}", "site-packages")
+if os.path.exists(_user_site_packages) and _user_site_packages not in sys.path:
+    sys.path.insert(0, _user_site_packages)
+
 from scipy.ndimage import gaussian_filter, binary_erosion
-from PIL import Image, ImageMath
+from PIL import Image
 
 if __name__ != "__main__" and __package__:
     importlib.reload(sys.modules[__name__])
 
 VERTEX_GROUP_SPLITTER = "::;::"
-DEBUG = True
 bake_queue = []
 is_baking = False
 group_bake_queue = []
@@ -61,6 +66,8 @@ def _process_group_queue():
             return 0.05
 
         job_entry = group_pipeline_jobs[group_pipeline_index]
+        group_name = job_entry.get("group_item").name if job_entry.get("group_item") else "Unknown"
+        
         if job_entry.get("combined_object") is not None:
             group_pipeline_index += 1
             return 0.05
@@ -70,6 +77,7 @@ def _process_group_queue():
         def _do_combine():
             global group_bake_active
             try:
+                objects = job_entry.get("objects")
                 combined_object = combine(job_entry.get("objects"))
                 job_entry["combined_object"] = combined_object
 
@@ -77,11 +85,13 @@ def _process_group_queue():
                 lightmap_uv.active = True
                 lightmap_uv.active_render = False
 
+                # smart_uv_unwrap needs its own context override since combine() context is closed
                 ctx = view3d_override()
                 with bpy.context.temp_override(**ctx):
                     smart_uv_unwrap(combined_object)
             except Exception as exc:
-                print("Group combine failed:", exc)
+                import traceback
+                traceback.print_exc()
             group_bake_active = False
             return None
 
@@ -96,6 +106,8 @@ def _process_group_queue():
 
         job_entry = group_pipeline_jobs[group_pipeline_index]
         combined_object = job_entry.get("combined_object")
+        group_name = job_entry.get("group_item").name if job_entry.get("group_item") else "Unknown"
+        resolution = job_entry.get("resolution", "Unknown")
 
         if combined_object is None:
             group_pipeline_index += 1
@@ -118,7 +130,8 @@ def _process_group_queue():
                 if job_entry.get("callback") is not None:
                     job_entry.get("callback")(image, lightmap_group)
             except Exception as exc:
-                print("Group bake callback failed:", exc)
+                import traceback
+                traceback.print_exc()
             job_entry["baked"] = True
             job_entry["baked_image"] = image
             group_bake_active = False
@@ -153,13 +166,15 @@ def _process_group_queue():
                 try:
                     group_pipeline_complete_callback(finished_jobs)
                 except Exception as exc:
-                    print("Group pipeline completion callback failed:", exc)
+                    import traceback
+                    traceback.print_exc()
 
             group_pipeline_complete_callback = None
             return None
 
         job_entry = group_pipeline_jobs[group_pipeline_index]
         combined_object = job_entry.get("combined_object")
+        group_name = job_entry.get("group_item").name if job_entry.get("group_item") else "Unknown"
 
         if job_entry.get("separated") is True:
             group_pipeline_index += 1
@@ -175,11 +190,13 @@ def _process_group_queue():
         def _do_separate():
             global group_bake_active
             try:
+                # seperate() handles setting the active object internally
                 old_objects = seperate(combined_object)
                 # store separated objects on the job entry
                 job_entry["separated_objects"] = old_objects
             except Exception as exc:
-                print("Group separation failed:", exc)
+                import traceback
+                traceback.print_exc()
                 job_entry["separated_objects"] = None
             job_entry["separated"] = True
             group_bake_active = False
@@ -511,17 +528,13 @@ class LightmapBaker:
         
         self._remove_targets(targets)
 
-
     def _bake_combined(self):
-        samples = bpy.context.scene.lgx_bake_samples.value
-        self._bake("COMBINED", self.img_combined, samples=samples)
-
-        albedo = np.array(self.img_combined.pixels[:], dtype=np.float32).reshape(512, 512, 4)
-        _debug_save_image(albedo, "COMBINED")
+        self._bake("COMBINED", self.img_combined, samples=self.samples)
 
     def _bake_albedo(self):
         overrides = []
-        for mat in self._materials():
+        materials = self._materials()
+        for i, mat in enumerate(materials):
             nt = mat.node_tree
             links = nt.links
             out = self._find_output(mat)
@@ -538,9 +551,10 @@ class LightmapBaker:
                 emit.inputs["Color"].default_value = fallback
             links.new(emit.outputs["Emission"], out.inputs["Surface"])
             overrides.append((mat, out, emit, orig_links))
-        self._bake("EMIT", self.img_albedo)
+        
+        self._bake("EMIT", self.img_albedo, samples=self.samples)
 
-        for mat, out, emit, orig_links in overrides:
+        for i, (mat, out, emit, orig_links) in enumerate(overrides):
             nt = mat.node_tree
             links = nt.links
             for l in list(out.inputs["Surface"].links):
@@ -553,13 +567,15 @@ class LightmapBaker:
     def _bake_mask(self):
         """
         Bake a mask:
+            pass
         - If BSDF Alpha has a texture → use that alpha directly as mask
         - If no alpha → pure white mask
         """
 
         overrides = []
+        materials = self._materials()
 
-        for mat in self._materials():
+        for i, mat in enumerate(materials):
             nt = mat.node_tree
             links = nt.links
 
@@ -587,6 +603,8 @@ class LightmapBaker:
                 alpha_input = bsdf.inputs.get("Alpha")
                 if alpha_input and alpha_input.is_linked:
                     alpha_source = alpha_input.links[0].from_socket
+                else:
+                    pass
 
             # ----------------------------------------------------
             # Build Emission for mask bake
@@ -610,10 +628,10 @@ class LightmapBaker:
             overrides.append((mat, out, emit, orig_links))
 
         # Bake EMIT → img_mask
-        self._bake("EMIT", self.img_mask)
+        self._bake("EMIT", self.img_mask, samples=self.samples)
 
         # Cleanup + restore
-        for mat, out, emit, orig_links in overrides:
+        for i, (mat, out, emit, orig_links) in enumerate(overrides):
             nt = mat.node_tree
             links = nt.links
 
@@ -631,170 +649,47 @@ class LightmapBaker:
         print("✔ Mask bake complete (direct alpha mask).")
 
     def _divide(self):
-        """
-        Perform Photoshop-style Divide (Combined / Albedo) using shader nodes
-        directly on the baked object, using the 'LightMap' UV set.
-        """
+        C = np.array(self.img_combined.pixels[:]).reshape(-1, 4)
+        
+        A = np.array(self.img_albedo.pixels[:]).reshape(-1, 4)
+        
+        A[:, :3] = np.clip(A[:, :3], 1e-4, 1.0)
+        
+        L = np.zeros_like(C)
+        L[:, :3] = C[:, :3] / A[:, :3]
+        L[:, 3] = 1.0
+        
+        self.img_final.pixels = L.flatten().tolist()
 
-        obj = self.obj
-        nt_created = []   # store (mat, node) for cleanup
-        link_backup = []  # (mat, out, orig_links)
-
-        # ------------------------------------------------------------
-        # Sanity: check LightMap UV exists on this mesh
-        # ------------------------------------------------------------
-        uv_layer_names = {uv.name for uv in obj.data.uv_layers}
-        use_lightmap_uv = "LightMap" in uv_layer_names
-        if not use_lightmap_uv:
-            print("⚠ No 'LightMap' UV found on", obj.name, "- Divide will use default UVs")
-
-        bake_img = self.img_final
-
-        # ============================================================
-        # 1. Override materials with Divide → Emission
-        # ============================================================
-        for mat in self._materials():
-            nt = mat.node_tree
-            nodes = nt.nodes
-            links = nt.links
-
-            # Find material output
-            out = self._find_output(mat)
-            if not out:
-                continue
-
-            # Backup original Surface links
-            orig_links = [(l.from_node, l.from_socket) for l in out.inputs["Surface"].links]
-            link_backup.append((mat, out, orig_links))
-
-            # Remove original Surface links
-            for l in list(out.inputs["Surface"].links):
-                links.remove(l)
-
-            # ---------------- UV node ----------------
-            uv_node = None
-            if use_lightmap_uv:
-                uv_node = nodes.new("ShaderNodeUVMap")
-                uv_node.uv_map = "LightMap"
-                uv_node.label = "LM UV"
-                uv_node.location = (-800, 40)
-                nt_created.append((mat, uv_node))
-
-            # ---------------- Textures ----------------
-            tex_C = nodes.new("ShaderNodeTexImage")  # Combined
-            tex_C.image = self.img_combined
-            tex_C.label = "LM Combined"
-            tex_C.interpolation = 'Linear'
-            tex_C.location = (-600, 140)
-            nt_created.append((mat, tex_C))
-
-            tex_A = nodes.new("ShaderNodeTexImage")  # Albedo
-            tex_A.image = self.img_albedo
-            tex_A.label = "LM Albedo"
-            tex_A.interpolation = 'Linear'
-            tex_A.location = (-600, -40)
-            nt_created.append((mat, tex_A))
-
-            # Feed LightMap UV into both textures
-            if uv_node is not None:
-                links.new(uv_node.outputs["UV"], tex_C.inputs["Vector"])
-                links.new(uv_node.outputs["UV"], tex_A.inputs["Vector"])
-
-            # ---------------- Divide mix ----------------
-            mix = nodes.new("ShaderNodeMixRGB")
-            mix.blend_type = "DIVIDE"
-            mix.inputs["Fac"].default_value = 1.0
-            mix.location = (-300, 40)
-            mix.label = "Combined / Albedo"
-            nt_created.append((mat, mix))
-
-            # Combined → Color1, Albedo → Color2
-            links.new(tex_C.outputs["Color"], mix.inputs["Color1"])
-            links.new(tex_A.outputs["Color"], mix.inputs["Color2"])
-
-            # ---------------- Emission + Output ----------------
-            emit = nodes.new("ShaderNodeEmission")
-            emit.location = (-50, 40)
-            emit.label = "Divide Emit"
-            nt_created.append((mat, emit))
-
-            links.new(mix.outputs["Color"], emit.inputs["Color"])
-            links.new(emit.outputs["Emission"], out.inputs["Surface"])
-
-            # ---------------- Bake Target node ----------------
-            tex_bake = nodes.new("ShaderNodeTexImage")
-            tex_bake.image = bake_img
-            tex_bake.label = "Bake Target"
-            tex_bake.location = (150, -120)
-            nt_created.append((mat, tex_bake))
-
-            nt.nodes.active = tex_bake
-
-        # ============================================================
-        # 2. Bake EMIT (Divide result) into self.img_final
-        # ============================================================
-        with bpy.context.temp_override(
-            object=obj,
-            active_object=obj,
-            selected_objects=[obj],
-            selected_editable_objects=[obj],
-        ):
-            bpy.ops.object.bake(
-                type='EMIT',
-                margin=4,
-                use_clear=True
-            )
-
-        # ============================================================
-        # 3. Restore original materials & clean up nodes
-        # ============================================================
-        for mat, out, orig_links in link_backup:
-            nt = mat.node_tree
-            links = nt.links
-
-            # Remove our temporary EMIT links
-            for l in list(out.inputs["Surface"].links):
-                links.remove(l)
-
-            # Restore original links
-            for from_node, from_socket in orig_links:
-                links.new(from_socket, out.inputs["Surface"])
-
-        # Delete all temp nodes we created
-        for mat, node in nt_created:
-            try:
-                mat.node_tree.nodes.remove(node)
-            except:
-                pass
-
-        print("✔ Divide bake complete (LightMap UV linked)")
+        composite_blurred_mask(self.img_final, self.img_mask)
 
 
 def _debug_save_image(arr, stepname): #turned off rn
-    return
     """Save a numpy RGBA array as PNG for debugging."""
-    h, w, c = arr.shape
-
-    # Create temp image
-    img = bpy.data.images.new(f"_debug_{stepname}", width=w, height=h, alpha=True, float_buffer=True)
-
-    # Flatten and assign
-    flat = np.clip(arr.reshape(-1), 0.0, 1.0).tolist()
-    img.pixels[:] = flat
-
-    # Build path
-    base_path = bpy.path.abspath(bpy.context.scene.lgx_bake_settings.LGX_bake_output_folder)
-    path = os.path.join(base_path, f"lightmap_{stepname}.png")
-
-    # Save it
-    img.filepath_raw = path
-    img.file_format = "PNG"
-    img.save()
-
-    print(f"✔ Saved debug step: {path}")
-
-    # Cleanup
-    bpy.data.images.remove(img, do_unlink=True)
+    # Function is currently disabled - uncomment the code below to enable
+    return
+    # h, w, c = arr.shape
+    #
+    # # Create temp image
+    # img = bpy.data.images.new(f"_debug_{stepname}", width=w, height=h, alpha=True, float_buffer=True)
+    #
+    # # Flatten and assign
+    # flat = np.clip(arr.reshape(-1), 0.0, 1.0).tolist()
+    # img.pixels[:] = flat
+    #
+    # # Build path
+    # base_path = bpy.path.abspath(bpy.context.scene.lgx_bake_settings.LGX_bake_output_folder)
+    # path = os.path.join(base_path, f"lightmap_{stepname}.png")
+    #
+    # # Save it
+    # img.filepath_raw = path
+    # img.file_format = "PNG"
+    # img.save()
+    #
+    # print(f"✔ Saved debug step: {path}")
+    #
+    # # Cleanup
+    # bpy.data.images.remove(img, do_unlink=True)
 
 #doing levels 
 def apply_levels(img, in_black=0.0, in_white=1.0, gamma=1.0,
@@ -803,7 +698,6 @@ def apply_levels(img, in_black=0.0, in_white=1.0, gamma=1.0,
     Photoshop Levels for both 2D grayscale (H,W)
     and 3D RGB(A) arrays (H,W,C).
     """
-
     img = img.astype(np.float32)
 
     # Normalize input range
@@ -823,6 +717,7 @@ def composite_blurred_mask(final_img, mask_img,
                            feather_px=1, contract_px=3, blur_px=3):
     """
     Photoshop-style compositing pipeline:
+        pass
 
     1. Contract mask (Shift Edge)
     2. Feather mask (Gaussian blur)
@@ -849,13 +744,14 @@ def composite_blurred_mask(final_img, mask_img,
     # ======================================================
     # 1. CONTRACT MASK
     # ======================================================
-
     _debug_save_image(np.stack([mask, mask, mask, np.ones_like(mask)], axis=2), "crisp mask")
     if contract_px > 0:
         binmask = mask > 0.5
-        for _ in range(contract_px):
+        for i in range(contract_px):
             binmask = binary_erosion(binmask)
         mask = binmask.astype(np.float32)
+    else:
+        pass
 
     _debug_save_image(np.stack([mask, mask, mask, np.ones_like(mask)], axis=2), "contracted")
 
@@ -864,6 +760,8 @@ def composite_blurred_mask(final_img, mask_img,
     # ======================================================
     if feather_px > 0:
         mask = gaussian_filter(mask, sigma=feather_px)
+    else:
+        pass
 
     mask = np.clip(mask, 0, 1)
 
@@ -954,6 +852,8 @@ def bake_lightmap_async(obj, lightmap_group, resolution=2048, callback=None):
     bake_queue.append((obj, lightmap_group, resolution, callback))
     if not bpy.app.timers.is_registered(_process_bake_queue):
         bpy.app.timers.register(_process_bake_queue, first_interval=0.01)
+    else:
+        pass
 
 def queue_group_bakes(group_items, resolution, callback, on_complete=None):
     global group_pipeline_stage
@@ -968,6 +868,7 @@ def queue_group_bakes(group_items, resolution, callback, on_complete=None):
     group_bake_queue.clear()
 
     index = 0
+    job_count = 0
 
     while index < len(group_items):
         entry = group_items[index]
@@ -975,7 +876,8 @@ def queue_group_bakes(group_items, resolution, callback, on_complete=None):
         object_index = 0
 
         while object_index < len(entry.objects):
-            object_list.append(entry.objects[object_index].obj)
+            obj = entry.objects[object_index].obj
+            object_list.append(obj)
             object_index += 1
 
         if len(object_list) > 0:
@@ -990,6 +892,9 @@ def queue_group_bakes(group_items, resolution, callback, on_complete=None):
                 "separated": False,
             }
             group_pipeline_jobs.append(job_entry)
+            job_count += 1
+        else:
+            pass
 
         index += 1
 
@@ -1003,6 +908,8 @@ def queue_group_bakes(group_items, resolution, callback, on_complete=None):
 
     if not bpy.app.timers.is_registered(_process_group_queue):
         bpy.app.timers.register(_process_group_queue, first_interval=0.01)
+    else:
+        pass
 
 def rebuild_groups_after_pipeline(finished_jobs):
     """
@@ -1012,13 +919,18 @@ def rebuild_groups_after_pipeline(finished_jobs):
     scene = bpy.context.scene
 
     # Clear existing groups
+    old_count = len(scene.my_items)
     scene.my_items.clear()
+    
     global baked_object
     baked_object = []
 
+    groups_created = 0
+    objects_added = 0
+
     for i, job in enumerate(finished_jobs):
         sep_objects = job.get("separated_objects")
-        print(sep_objects)
+        group_name = job.get("group_item").name if job.get("group_item") else f"Job {i+1}"
 
         if not sep_objects:
             continue  # skip empty jobs
@@ -1026,11 +938,13 @@ def rebuild_groups_after_pipeline(finished_jobs):
         # Make new group entry
         group = scene.my_items.add()
         group.name = f"Lightgroup {len(scene.my_items)}"
+        groups_created += 1
 
-        for obj in sep_objects:
+        for j, obj in enumerate(sep_objects):
             entry = group.objects.add()
             entry.obj = obj
             baked_object.append(obj)
+            objects_added += 1
     
     props = bpy.context.scene.lgx_preview_props
     props.disable_preview_on = False
@@ -1051,6 +965,8 @@ def ensure_lightmap_uv(mesh_object):
 
     if uv_layer is None:
         uv_layer = mesh_data.uv_layers.new(name="LightMap")
+    else:
+        pass
 
     return uv_layer
 
@@ -1103,11 +1019,10 @@ def smart_uv_unwrap(mesh_object):
 
     ensure_object_mode_is('OBJECT')
 
-
-    bpy.ops.object.mode_set(mode='OBJECT')
-
 def assign_lightmap_to_materials(mesh_object, baked_image):
+    
     slot_index = 0
+    assigned_count = 0
 
     while slot_index < len(mesh_object.material_slots):
         slot = mesh_object.material_slots[slot_index]
@@ -1133,7 +1048,6 @@ def assign_lightmap_to_materials(mesh_object, baked_image):
                 emission_input = principled.inputs["Emission Color"]
 
                 if emission_input is None:
-                    print("No emission input on Principled for material:", material.name)
                     slot_index += 1
                     continue
 
@@ -1148,8 +1062,10 @@ def assign_lightmap_to_materials(mesh_object, baked_image):
 
                 # Connect texture color → Principled emission input
                 links.new(texture_node.outputs["Color"], emission_input)
+                assigned_count += 1
 
         slot_index += 1
+
 
 def ensure_object_mode_is(mode_name):
     """Safely ensure the active object is in the specified mode."""
@@ -1171,11 +1087,18 @@ def ensure_object_mode_is(mode_name):
         pass
 
 def make_object_active_and_selected(target_object):
-    bpy.ops.object.select_all(action="DESELECT")
+    """Safely make an object active and selected, avoiding bpy.ops when possible."""
+    # Use direct API calls instead of bpy.ops to avoid context issues
+    # Deselect all objects (use list copy to avoid modification during iteration)
+    selected_objects = list(bpy.context.selected_objects)
+    for obj in selected_objects:
+        obj.select_set(False)
+    # Select and activate target
     target_object.select_set(True)
     bpy.context.view_layer.objects.active = target_object
 
 def view3d_override():
+    """Get a VIEW_3D context override, or None if not found."""
     for window in bpy.context.window_manager.windows:
         for area in window.screen.areas:
             if area.type == 'VIEW_3D':
@@ -1597,39 +1520,49 @@ def preview_object(object: bpy.types.Object, preview=True):
         # Don't increment materials_processed since we didn't process it
 
 def rebuild_baked_mat_list():
-    all_objects = bpy.context.selectable_objects
+    # Check ALL objects in the scene, not just selectable ones
+    # This ensures we find all objects with lightmaps, even if they're not currently selectable
+    all_objects = [obj for obj in bpy.data.objects if obj.type == "MESH"]
 
     global baked_object
     baked_object.clear()
 
     for obj in all_objects:
-        if obj.type == "MESH":
+        # Skip lights and other non-MESH objects (already filtered, but double-check)
+        if obj.type != "MESH":
+            continue
+        
+        mat = obj.active_material
+        if mat is None or not mat.use_nodes:
+            continue
 
-            mat = obj.active_material
-            if not mat:
-                continue
-            nodes = mat.node_tree.nodes
-            links = mat.node_tree.links
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
 
-            bsdf = None
-            for n in nodes:
-                if n.type == "BSDF_PRINCIPLED":
-                    bsdf = n
-                    break
-            
-            emit_input = bsdf.inputs["Emission Color"]
+        bsdf = None
+        for n in nodes:
+            if n.type == "BSDF_PRINCIPLED":
+                bsdf = n
+                break
+        
+        if bsdf is None:
+            continue
+        
+        emit_input = bsdf.inputs.get("Emission Color")
+        if emit_input is None:
+            continue
 
-            if emit_input.is_linked:
-                em_link = emit_input.links[0]
-                em_node = em_link.from_socket.node
+        if emit_input.is_linked:
+            em_link = emit_input.links[0]
+            em_node = em_link.from_socket.node
 
-                if em_node.type == "TEX_IMAGE":
-                    img = em_node.image
+            if em_node.type == "TEX_IMAGE":
+                img = em_node.image
+                if img and img.filepath:
                     filename = os.path.basename(img.filepath)
 
-                    if ("lightmap_Lightgroup" in filename) or "LM_Final_" in filename:
+                    if "lightmap_Lightgroup" in filename:
                         baked_object.append(obj)
-                        print(filename)
 
 def preview_init_check():
     rebuild_baked_mat_list()
@@ -1780,6 +1713,7 @@ def ensure_unique_material(obj):
 
     # Duplicate material
     new_mat = mat.copy()
+    new_mat.name = f"{mat.name}_unique_{obj.name}"
 
     # Assign to this object
     obj.active_material = new_mat
@@ -1787,40 +1721,6 @@ def ensure_unique_material(obj):
     print(f"✔ {obj.name} now uses its own material: {new_mat.name}")
 
 
-class LGX_bake_samples(bpy.types.PropertyGroup):
-
-    def update_samples(self, context):
-        # Map enum → numeric samples
-        SAMPLES_MAP = {
-            "LOW": 32,
-            "MEDIUM": 64,
-            "NORMAL": 128,
-            "HIGH": 256,
-            "VERY_HIGH": 512,
-            "ULTRA": 1024,
-        }
-        self.value = SAMPLES_MAP[self.mode]
-
-    mode: bpy.props.EnumProperty(
-        name="Samples",
-        description="Select number of Cycles samples for baking",
-        items=[
-            ("LOW", "32", "Low samples, fastest (may have noise)"),
-            ("MEDIUM", "64", "Medium samples, good balance"),
-            ("NORMAL", "128", "Normal samples (default, recommended)"),
-            ("HIGH", "256", "High samples, better quality"),
-            ("VERY_HIGH", "512", "Very high samples, excellent quality"),
-            ("ULTRA", "1024", "Ultra samples, best quality (slowest)"),
-        ],
-        default="NORMAL",
-        update=update_samples,
-    )# type: ignore
-
-    # Stores actual numeric samples
-    value: bpy.props.IntProperty(
-        name="Samples Value",
-        default=128
-    )# type: ignore
 
 class LGX_PreviewProps(bpy.types.PropertyGroup):
     disable_preview_on: bpy.props.BoolProperty(
@@ -1880,6 +1780,41 @@ class LGX_resolution(bpy.types.PropertyGroup):
         default=1024
     )# type: ignore
 
+class LGX_bake_samples(bpy.types.PropertyGroup):
+
+    def update_samples(self, context):
+        # Map enum → numeric samples
+        SAMPLES_MAP = {
+            "LOW": 32,
+            "MEDIUM": 64,
+            "NORMAL": 128,
+            "HIGH": 256,
+            "VERY_HIGH": 512,
+            "ULTRA": 1024,
+        }
+        self.value = SAMPLES_MAP[self.mode]
+
+    mode: bpy.props.EnumProperty(
+        name="Samples",
+        description="Select number of Cycles samples for baking",
+        items=[
+            ("LOW", "32", "Low samples, fastest (may have noise)"),
+            ("MEDIUM", "64", "Medium samples, good balance"),
+            ("NORMAL", "128", "Normal samples (default, recommended)"),
+            ("HIGH", "256", "High samples, better quality"),
+            ("VERY_HIGH", "512", "Very high samples, excellent quality"),
+            ("ULTRA", "1024", "Ultra samples, best quality (slowest)"),
+        ],
+        default="NORMAL",
+        update=update_samples,
+    )# type: ignore
+
+    # Stores actual numeric samples
+    value: bpy.props.IntProperty(
+        name="Samples Value",
+        default=128
+    )# type: ignore
+
 
 class LGX_UL_mylist(bpy.types.UIList):
     bl_idname = "LGX_UL_mylist"
@@ -1890,19 +1825,6 @@ class LGX_UL_mylist(bpy.types.UIList):
         elif self.layout_type in {'GRID'}:
             layout.alignment = 'CENTER'
             layout.label(text="")
-
-class LGX_delete_lightmap_groups(bpy.types.Operator):
-    bl_idname = "lgx.del_lightmap"
-    bl_label = "delete groups"
-    
-    def execute(self, context):
-        scene = context.scene
-        for group_idx in range(len(scene.my_items)):
-            scene.my_items.remove(group_idx)
-
-        scene.my_items_index = 0
-
-        return {"FINISHED"}
 
 class LGX_OT_add_item(bpy.types.Operator):
     bl_idname = "lgx.add_item"
@@ -1987,47 +1909,252 @@ class LGX_OT_UV_uwrap_uvs(bpy.types.Operator):
 #preview
 class LGX_OT_preview_on(bpy.types.Operator):
     bl_idname = "lgx.preview_on"
-    bl_label = "unwrap UVS"
+    bl_label = "Preview ON - Process ALL Selected Objects"
+    bl_description = "Enable lightmap preview on ALL selected mesh objects"
+    
+    @classmethod
+    def poll(cls, context):
+        # Always allow the operator to run
+        return True
+    
+    def invoke(self, context, event):
+        # CRITICAL: Print immediately to confirm operator is called
+        import sys
+        print("\n" + "=" * 80)
+        print("[PREVIEW ON] *** INVOKE METHOD CALLED - OPERATOR IS RUNNING! ***")
+        print("=" * 80 + "\n")
+        # Always call execute
+        result = self.execute(context)
+        print("\n[PREVIEW ON] *** INVOKE COMPLETE ***\n")
+        return result
 
     def execute(self, context):
-        global baked_object
-        print(baked_object)
+        print("=" * 80)
+        print("[PREVIEW ON] EXECUTE METHOD CALLED - OPERATOR IS RUNNING!")
+        print("=" * 80)
+        import sys
+        
+        try:
+            print(f"[PREVIEW ON] === OPERATOR EXECUTE CALLED ===")
+            
+            # Process ALL selected objects, not just baked_object list
+            # CRITICAL: Get objects from multiple sources to ensure we catch everything
+            selected_objects = []
+            selected_names = set()
+            
+            # Method 1: context.selected_objects
+            print(f"[PREVIEW ON] Method 1: Checking context.selected_objects ({len(context.selected_objects)} objects)")
+            for obj in context.selected_objects:
+                if obj not in selected_objects:
+                    selected_objects.append(obj)
+                    selected_names.add(obj.name)
+                    print(f"[PREVIEW ON]   Added: {obj.name}")
+            
+            # Method 2: Check all objects in view_layer for selection
+            if hasattr(context, 'view_layer') and hasattr(context.view_layer, 'objects'):
+                print(f"[PREVIEW ON] Method 2: Checking view_layer.objects")
+                for obj in context.view_layer.objects:
+                    try:
+                        if obj.select_get() and obj.name not in selected_names:
+                            selected_objects.append(obj)
+                            selected_names.add(obj.name)
+                            print(f"[PREVIEW ON]   Added from view_layer: {obj.name}")
+                    except:
+                        pass
+            
+            # Method 3: Also check bpy.context directly (sometimes more reliable)
+            try:
+                print(f"[PREVIEW ON] Method 3: Checking bpy.context.selected_objects ({len(bpy.context.selected_objects)} objects)")
+                for obj in bpy.context.selected_objects:
+                    if obj.name not in selected_names:
+                        selected_objects.append(obj)
+                        selected_names.add(obj.name)
+                        print(f"[PREVIEW ON]   Added from bpy.context: {obj.name}")
+            except Exception as e:
+                print(f"[PREVIEW ON] Method 3 error: {e}")
+            
+            
+            print(f"[PREVIEW ON] === COLLECTION COMPLETE ===")
+            print(f"[PREVIEW ON] Total collected objects: {len(selected_objects)}")
+            for idx, obj in enumerate(selected_objects):
+                print(f"[PREVIEW ON]   [{idx+1}] {obj.name} (type: {obj.type})")
+            
+            if len(selected_objects) == 0:
+                print("[PREVIEW ON] ERROR: No objects found! Checking all scene objects...")
+                # FALLBACK: Process ALL mesh objects in scene if nothing is selected
+                all_meshes = [obj for obj in bpy.data.objects if obj.type == "MESH"]
+                print(f"[PREVIEW ON] Found {len(all_meshes)} total mesh objects in scene")
+                if len(all_meshes) > 0:
+                    print("[PREVIEW ON] WARNING: No objects selected, but processing all mesh objects as fallback")
+                    selected_objects = all_meshes
+                else:
+                    print("[PREVIEW ON] No objects selected and no mesh objects in scene")
+                    return {"FINISHED"}
 
-        if len(baked_object) == 0:
-            print("attempting to rebuild baked groups")
-            rebuild_baked_mat_list()
-            if len(baked_object) == 0:
-                return {"FINISHED"}
+            props = context.scene.lgx_preview_props
+            props.disable_preview_off = False   # disable OFF button
+            props.disable_preview_on = True
 
-        props = context.scene.lgx_preview_props
-        props.disable_preview_off = False   # disable OFF button
-        props.disable_preview_on = True
-
-        for obj in baked_object:
-            preview_object(obj, preview=True)
+            processed_count = 0
+            skipped_count = 0
+            error_count = 0
+            
+            print(f"[PREVIEW ON] Starting to process {len(selected_objects)} object(s)...")
+            
+            for idx, obj in enumerate(selected_objects):
+                try:
+                    print(f"[PREVIEW ON] --- Processing object {idx+1}/{len(selected_objects)}: '{obj.name}' ---")
+                    
+                    # Skip non-MESH objects (lights, cameras, etc.)
+                    if obj.type != "MESH":
+                        print(f"[PREVIEW ON] Skipping '{obj.name}' (not a MESH, type: {obj.type})")
+                        skipped_count += 1
+                        continue
+                    
+                    print(f"[PREVIEW ON] Calling preview_object() for '{obj.name}'...")
+                    
+                    preview_object(obj, preview=True)
+                    
+                    processed_count += 1
+                    print(f"[PREVIEW ON] ✓ Successfully processed '{obj.name}' ({processed_count} total)")
+                    
+                except Exception as e:
+                    print(f"[PREVIEW ON] ✗ ERROR processing '{obj.name}': {e}")
+                    import traceback
+                    traceback.print_exc()
+                    error_count += 1
+                    continue
+            
+            print(f"[PREVIEW ON] === COMPLETE === Processed: {processed_count}, Skipped: {skipped_count}, Errors: {error_count}")
+            
+        except Exception as e:
+            print(f"[PREVIEW ON] FATAL ERROR in operator: {e}")
+            import traceback
+            traceback.print_exc()
         
         return {"FINISHED"}
 
 class LGX_OT_preview_off(bpy.types.Operator):
     bl_idname = "lgx.preview_off"
-    bl_label = "unwrap UVS"
+    bl_label = "Preview OFF - Process ALL Selected Objects"
+    bl_description = "Disable lightmap preview on ALL selected mesh objects"
+    
+    @classmethod
+    def poll(cls, context):
+        # Always allow the operator to run
+        return True
+    
+    def invoke(self, context, event):
+        print("=" * 80)
+        print("[PREVIEW OFF] INVOKE METHOD CALLED - OPERATOR IS RUNNING!")
+        print("=" * 80)
+        import sys
+        # Always call execute
+        return self.execute(context)
 
     def execute(self, context):
-        global baked_object
-        print(baked_object)
-
-        if len(baked_object) == 0:
-            print("attempting to rebuild baked groups")
-            rebuild_baked_mat_list()
-            if len(baked_object) == 0:
+        print("=" * 80)
+        print("[PREVIEW OFF] EXECUTE METHOD CALLED - OPERATOR IS RUNNING!")
+        print("=" * 80)
+        import sys
+        
+        try:
+            print(f"[PREVIEW OFF] === OPERATOR EXECUTE CALLED ===")
+            
+            # Process ALL selected objects, not just baked_object list
+            # CRITICAL: Get objects from multiple sources to ensure we catch everything
+            selected_objects = []
+            selected_names = set()
+            
+            # Method 1: context.selected_objects
+            print(f"[PREVIEW OFF] Method 1: Checking context.selected_objects ({len(context.selected_objects)} objects)")
+            for obj in context.selected_objects:
+                if obj not in selected_objects:
+                    selected_objects.append(obj)
+                    selected_names.add(obj.name)
+                    print(f"[PREVIEW OFF]   Added: {obj.name}")
+            
+            # Method 2: Check all objects in view_layer for selection
+            if hasattr(context, 'view_layer') and hasattr(context.view_layer, 'objects'):
+                print(f"[PREVIEW OFF] Method 2: Checking view_layer.objects")
+                for obj in context.view_layer.objects:
+                    try:
+                        if obj.select_get() and obj.name not in selected_names:
+                            selected_objects.append(obj)
+                            selected_names.add(obj.name)
+                            print(f"[PREVIEW OFF]   Added from view_layer: {obj.name}")
+                    except:
+                        pass
+            
+            # Method 3: Also check bpy.context directly (sometimes more reliable)
+            try:
+                print(f"[PREVIEW OFF] Method 3: Checking bpy.context.selected_objects ({len(bpy.context.selected_objects)} objects)")
+                for obj in bpy.context.selected_objects:
+                    if obj.name not in selected_names:
+                        selected_objects.append(obj)
+                        selected_names.add(obj.name)
+                        print(f"[PREVIEW OFF]   Added from bpy.context: {obj.name}")
+            except Exception as e:
+                print(f"[PREVIEW OFF] Method 3 error: {e}")
+            
+            
+            print(f"[PREVIEW OFF] === COLLECTION COMPLETE ===")
+            print(f"[PREVIEW OFF] Total collected objects: {len(selected_objects)}")
+            for idx, obj in enumerate(selected_objects):
+                print(f"[PREVIEW OFF]   [{idx+1}] {obj.name} (type: {obj.type})")
+            
+            if len(selected_objects) == 0:
+                print("[PREVIEW OFF] ERROR: No objects found! Checking all scene objects...")
+                # FALLBACK: Process ALL mesh objects in scene if nothing is selected
+                all_meshes = [obj for obj in bpy.data.objects if obj.type == "MESH"]
+                print(f"[PREVIEW OFF] Found {len(all_meshes)} total mesh objects in scene")
+                if len(all_meshes) > 0:
+                    print("[PREVIEW OFF] WARNING: No objects selected, but processing all mesh objects as fallback")
+                    selected_objects = all_meshes
+                else:
+                    print("[PREVIEW OFF] No objects selected and no mesh objects in scene")
                 return {"FINISHED"}
         
-        props = context.scene.lgx_preview_props
-        props.disable_preview_off = True   # disable OFF button
-        props.disable_preview_on = False
+            props = context.scene.lgx_preview_props
+            props.disable_preview_off = True   # disable OFF button
+            props.disable_preview_on = False
 
-        for obj in baked_object:
-            preview_object(obj, preview=False)
+            processed_count = 0
+            skipped_count = 0
+            error_count = 0
+            
+            print(f"[PREVIEW OFF] Starting to process {len(selected_objects)} object(s)...")
+            
+            for idx, obj in enumerate(selected_objects):
+                try:
+                    print(f"[PREVIEW OFF] --- Processing object {idx+1}/{len(selected_objects)}: '{obj.name}' ---")
+                    
+                    # Skip non-MESH objects (lights, cameras, etc.)
+                    if obj.type != "MESH":
+                        print(f"[PREVIEW OFF] Skipping '{obj.name}' (not a MESH, type: {obj.type})")
+                        skipped_count += 1
+                        continue
+                    
+                    print(f"[PREVIEW OFF] Calling preview_object() for '{obj.name}'...")
+                    
+                    preview_object(obj, preview=False)
+                    
+                    processed_count += 1
+                    print(f"[PREVIEW OFF] ✓ Successfully processed '{obj.name}' ({processed_count} total)")
+                    
+                except Exception as e:
+                    print(f"[PREVIEW OFF] ✗ ERROR processing '{obj.name}': {e}")
+                    import traceback
+                    traceback.print_exc()
+                    error_count += 1
+                    continue
+
+            print(f"[PREVIEW OFF] === COMPLETE === Processed: {processed_count}, Skipped: {skipped_count}, Errors: {error_count}")
+            
+        except Exception as e:
+            print(f"[PREVIEW OFF] FATAL ERROR in operator: {e}")
+            import traceback
+            traceback.print_exc()
 
         return {"FINISHED"}
 
@@ -2126,20 +2253,21 @@ class LGX_bake_lightmap(bpy.types.Operator):
         scene = context.scene
 
         rebuild_baked_mat_list()
+        
         remove_lightmaps()
 
-
+        material_count = 0
         for group in scene.my_items:
             for ref in group.objects:
                 obj = ref.obj
                 ensure_unique_material(obj)
+                material_count += 1
 
-
+        resolution = context.scene.lgx_render_resolution.value
 
         def save_lightmap(img, lightmap_group):
 
             base_path = bpy.path.abspath(context.scene.lgx_bake_settings.LGX_bake_output_folder)
-
 
             path = os.path.join(base_path, f"lightmap_{lightmap_group}.png")
 
@@ -2150,7 +2278,7 @@ class LGX_bake_lightmap(bpy.types.Operator):
 
         queue_group_bakes(
             scene.my_items,
-            resolution=context.scene.lgx_render_resolution.value,
+            resolution=resolution,
             callback=save_lightmap,
             on_complete=rebuild_groups_after_pipeline
         )
@@ -2195,29 +2323,6 @@ class LGX_preview_off(bpy.types.Operator):
 
         return {'FINISHED'}
 
-class LGX_ensure_unique(bpy.types.Operator):
-    bl_idname = "lgx.ensure_unique"
-    bl_label = "uwu"
-    def execute(self, context):
-        objects:list[bpy.types.Object] = bpy.context.selected_objects
-
-
-        for obj in objects:
-            ensure_unique_material(obj)
-            
-            print(obj.active_material.name)
-
-        return {"FINISHED"}
-
-class LGX_debug_rebuild(bpy.types.Operator):
-    bl_idname = "lgx.dbg_rebuild"
-    bl_label = ""
-
-    def execute(self, context):
-        rebuild_baked_mat_list()
-        
-        return {"FINISHED"}
-
 #panels
 class LGX_PT_panel(bpy.types.Panel):
     bl_label = "LumaxGL"
@@ -2238,7 +2343,6 @@ class LGX_PT_panel(bpy.types.Panel):
         row = box.row()
         box.operator("lgx.lightmap_groups_generator", icon="ZOOM_SELECTED", text="Generate Groups")
         box.prop(context.scene.lgx_group_generator_count, "count")
-        box.operator("lgx.del_lightmap", icon="KEY_BACKSPACE_FILLED")
 
 
         box.template_list(
@@ -2283,53 +2387,21 @@ class LGX_PT_panel(bpy.types.Panel):
 
                 # --- Preview ON ---
         on_col = row.column()
-        on_col.enabled = not props.disable_preview_on
+        # TEMPORARILY DISABLE THE ENABLED CHECK TO TEST
+        # on_col.enabled = not props.disable_preview_on
+        on_col.enabled = True  # Force enable for testing
         on_col.operator("lgx.preview_on", text="Preview ON")
 
         # --- Preview OFF ---
         off_col = row.column()
-        off_col.enabled = not props.disable_preview_off
+        # TEMPORARILY DISABLE THE ENABLED CHECK TO TEST
+        # off_col.enabled = not props.disable_preview_off
+        off_col.enabled = True  # Force enable for testing
         off_col.operator("lgx.preview_off", text="Preview OFF")
 
         box.operator("lgx.remove_lightmap", text="Reset")
 
-class LGX_PT_debug(bpy.types.Panel):
-    bl_label = "Debug"
-    bl_idname = "LGX_PT_debug"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "LumaxGL"
-
-    def draw(self, context):
-        layout = self.layout
-        layout.label(text="Debug Stuff")
-
-        layout.operator("lgx.combine", text="Combine (Preserve Types)")
-        layout.operator("lgx.restore", text="Separate & Restore")
-        layout.separator()
-        layout.operator("lgx._uwrap_uvs", text = "unwrap selected objects")
-
-        layout.label(text=f"current selected group {context.scene.my_items_index}")
-
-        layout.label(text=f"render res = {context.scene.lgx_render_resolution.value}")
-
-        layout.operator("lgx.ensure_unique", text = "unique")
-
-        layout.operator("lgx.dbg_rebuild", text="rebuild mats")
-        box = layout.box()
-
-        box.label(text="preview_objects")
-        box.operator("lgx.dbg_preview_on", text="Preview On")
-        box.operator("lgx.dbg_preview_off", text="Preview Off")
-
-
-
-
-
 classes = [
-    LGX_delete_lightmap_groups,
-    LGX_bake_samples,
-    LGX_ensure_unique,
     LGX_remove_lightmaps,
     LGX_PreviewProps,
     LGX_OT_preview_on,
@@ -2337,6 +2409,7 @@ classes = [
     LGX_preview_off,
     LGX_preview_on,
     LGX_resolution,
+    LGX_bake_samples,
     LGX_ObjectRef,
     LGX_group_generator_count,
     LGX_ListItem,
@@ -2356,15 +2429,6 @@ classes = [
     LGX_PT_panel,
 ]
 
-debug_classes = [
-    LGX_OT_UV_uwrap_uvs,
-    LGX_debug_rebuild,
-    LGX_PT_debug
-]
-
-if DEBUG == True:
-    classes.extend(debug_classes)
-
 def register():
     global baked_object
     for class_type in classes:
@@ -2373,9 +2437,9 @@ def register():
     bpy.types.Scene.lgx_bake_settings = bpy.props.PointerProperty(type=LGX_bake_output_file)
     bpy.types.Scene.my_items = bpy.props.CollectionProperty(type=LGX_ListItem)
     bpy.types.Scene.my_items_index = bpy.props.IntProperty(default=0)
-    bpy.types.Scene.lgx_bake_samples = bpy.props.PointerProperty(type=LGX_bake_samples)
     bpy.types.Scene.lgx_group_generator_count = bpy.props.PointerProperty(type=LGX_group_generator_count)
     bpy.types.Scene.lgx_render_resolution = bpy.props.PointerProperty(type=LGX_resolution)
+    bpy.types.Scene.lgx_bake_samples = bpy.props.PointerProperty(type=LGX_bake_samples)
     bpy.types.Scene.lgx_preview_props = bpy.props.PointerProperty(type=LGX_PreviewProps)
 
     preview_init_check()
@@ -2384,9 +2448,9 @@ def unregister():
     del bpy.types.Scene.lgx_bake_settings
     del bpy.types.Scene.my_items
     del bpy.types.Scene.my_items_index    
-    del bpy.types.Scene.lgx_bake_samples
     del bpy.types.Scene.lgx_group_generator_count
     del bpy.types.Scene.lgx_render_resolution
+    del bpy.types.Scene.lgx_bake_samples
     del bpy.types.Scene.lgx_preview_props
 
     for class_type in reversed(classes):
