@@ -77,9 +77,7 @@ def _process_group_queue():
                 lightmap_uv.active = True
                 lightmap_uv.active_render = False
 
-                ctx = view3d_override()
-                with bpy.context.temp_override(**ctx):
-                    smart_uv_unwrap(combined_object)
+                smart_uv_unwrap(combined_object)
             except Exception as exc:
                 print("Group combine failed:", exc)
             group_bake_active = False
@@ -175,6 +173,7 @@ def _process_group_queue():
         def _do_separate():
             global group_bake_active
             try:
+                make_object_active_and_selected(combined_object)
                 old_objects = seperate(combined_object)
                 # store separated objects on the job entry
                 job_entry["separated_objects"] = old_objects
@@ -208,15 +207,12 @@ def _process_bake_queue():
     def _do_bake():
         global is_baking
         try:
-            # Get samples from scene settings
-            samples = bpy.context.scene.lgx_bake_samples.value
-            baker = LightmapBaker(resolution, samples=samples)
+            baker = LightmapBaker(resolution)
             img = baker.run(obj, lightmap_group)
             if callback:
                 callback(img, lightmap_group)
         except Exception as e:
-            import traceback
-            traceback.print_exc()
+            print("Lightmap bake failed:", e)
 
         is_baking = False
         return None  # finish this bake
@@ -224,9 +220,8 @@ def _process_bake_queue():
     bpy.app.timers.register(_do_bake, first_interval=0.01)
     return 0.2  # check queue again
 class LightmapBaker:
-    def __init__(self, resolution=2048, samples=128):
+    def __init__(self, resolution=2048):
         self.resolution = resolution
-        self.samples = samples
         self.obj = None
         self.scene = bpy.context.scene
         self.cycles = None
@@ -331,19 +326,16 @@ class LightmapBaker:
         for device in prefs.get_devices()[0]:
             device.use = True
 
-    def _bake(self, bake_type, image, samples=128):
+    def _bake(self, bake_type, image, samples=10):
     # Set bake samples
         #self._enable_best_gpu()
 
-        # Verify object setup
-        
         bpy.context.scene.cycles.samples = samples
 
         bpy.context.scene.render.bake.margin = 0  # pixels of bleed
         bpy.context.scene.render.bake.margin_type = 'ADJACENT_FACES'  # best quality
 
         targets = self._apply_targets(image)
-        
         self.cycles.bake_type = bake_type
         self.cycles.use_bake_clear = True
         self.cycles.use_pass_color = True
@@ -352,165 +344,15 @@ class LightmapBaker:
         self.cycles.use_denoising = True
         self.cycles.filter_width = 1.0
 
-        
-        # CRITICAL: Ensure object is valid and mesh data is updated
-        if self.obj is None or self.obj.type != 'MESH':
-            raise RuntimeError(f"Invalid object for baking: {self.obj}")
-        
-        if self.obj.data is None:
-            raise RuntimeError(f"Object '{self.obj.name}' has no mesh data")
-        
-        # CRITICAL: Ensure object is in the active scene
-        scene = bpy.context.scene
-        if self.obj.name not in scene.objects:
-            scene.collection.objects.link(self.obj)
-        
-        # Update mesh data to ensure it's valid
-        self.obj.data.update()
-        
-        # CRITICAL FIX: Set object as active in the actual context before override
-        # This ensures the context has valid data when bake_init_api_data runs
-        view_layer = bpy.context.view_layer
-        view_layer.objects.active = self.obj
-        self.obj.select_set(True)
-        
-        # Verify the object is actually active
-        if view_layer.objects.active != self.obj:
-            raise RuntimeError(f"Failed to set '{self.obj.name}' as active object")
-        
-        # Ensure we're in OBJECT mode
-        if self.obj.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        
-        # CRITICAL: Ensure context has valid scene and view_layer
-        if bpy.context.scene != scene:
-            pass
-        if bpy.context.view_layer != view_layer:
-            pass
-        
-        # Get proper context override with all required fields
-        scene = bpy.context.scene
-        view_layer = bpy.context.view_layer
-        
-        # Find a valid VIEW_3D area for context
-        override_area = None
-        override_region = None
-        override_window = None
-        override_screen = None
-        
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'VIEW_3D':
-                    for region in area.regions:
-                        if region.type == 'WINDOW':
-                            override_area = area
-                            override_region = region
-                            override_window = window
-                            override_screen = window.screen
-                            break
-                    if override_area:
-                        break
-                if override_area:
-                    break
-            if override_area:
-                break
-        
-        # Fallback to current context if no VIEW_3D found
-        if not override_area:
-            override_window = bpy.context.window
-            override_screen = bpy.context.screen
-        
-        try:
-            # Build context override with all required fields
-            override_dict = {
-                'scene': scene,
-                'view_layer': view_layer,
-                'active_object': self.obj,
-                'selected_objects': [self.obj],
-                'selected_editable_objects': [self.obj],
-                'object': self.obj,
-            }
-            
-            # Add window/screen/area/region if available
-            if override_window:
-                override_dict['window'] = override_window
-            if override_screen:
-                override_dict['screen'] = override_screen
-            if override_area:
-                override_dict['area'] = override_area
-            if override_region:
-                override_dict['region'] = override_region
-            
-            
-            # Final validation before bake
-            
-            # Ensure object mesh data is valid
-            if self.obj.data.users == 0:
-                raise RuntimeError(f"Mesh data for '{self.obj.name}' has no users")
-            
-            
-            # CRITICAL FIX: Try calling bake without temp_override first
-            # If that fails due to context issues, fall back to temp_override
-            # This ensures the context has a valid main pointer
-            
-            # Save current active object to restore later
-            old_active = view_layer.objects.active
-            old_selected = list(bpy.context.selected_objects)
-            
-            try:
-                # Set up real context
-                for obj in old_selected:
-                    obj.select_set(False)
-                self.obj.select_set(True)
-                view_layer.objects.active = self.obj
-                
-                # Ensure object is still valid
-                if self.obj.name not in bpy.data.objects:
-                    raise RuntimeError(f"Object '{self.obj.name}' no longer exists in bpy.data.objects")
-                
-                # Verify context is valid
-                if bpy.context.active_object != self.obj:
-                    raise RuntimeError("Context mismatch, will use temp_override")
-                
-                result = bpy.ops.object.bake(type=bake_type)
-                
-            except (RuntimeError, AttributeError) as e:
-                
-                # Restore old selection
-                for obj in old_selected:
-                    obj.select_set(True)
-                view_layer.objects.active = old_active
-                
-                # Fallback to temp_override
-                with bpy.context.temp_override(**override_dict):
-                    # Double-check object is active
-                    if view_layer.objects.active != self.obj:
-                        view_layer.objects.active = self.obj
-                    
-                    # Ensure object is still valid
-                    if self.obj.name not in bpy.data.objects:
-                        raise RuntimeError(f"Object '{self.obj.name}' no longer exists in bpy.data.objects")
-                    
-                    result = bpy.ops.object.bake(type=bake_type)
-            
-            finally:
-                # Restore old selection state
-                for obj in bpy.context.selected_objects:
-                    obj.select_set(False)
-                for obj in old_selected:
-                    obj.select_set(True)
-                view_layer.objects.active = old_active
-            
-            if result != {'FINISHED'}:
-                pass
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            raise
-        
+        with bpy.context.temp_override(
+            object=self.obj,
+            active_object=self.obj,
+            selected_objects=[self.obj],
+            selected_editable_objects=[self.obj],
+        ):
+            bpy.ops.object.bake(type=bake_type)
         
         self._remove_targets(targets)
-
 
     def _bake_combined(self):
         samples = bpy.context.scene.lgx_bake_samples.value
@@ -632,142 +474,40 @@ class LightmapBaker:
 
     def _divide(self):
         """
-        Perform Photoshop-style Divide (Combined / Albedo) using shader nodes
-        directly on the baked object, using the 'LightMap' UV set.
+        Photoshop-accurate Divide blend mode using pure Pillow operations.
+        Result = clamp(Base / max(Blend, 1), 0–1)
         """
 
-        obj = self.obj
-        nt_created = []   # store (mat, node) for cleanup
-        link_backup = []  # (mat, out, orig_links)
+        w, h = self.img_combined.size
 
         # ------------------------------------------------------------
-        # Sanity: check LightMap UV exists on this mesh
+        # Convert Blender float image → Pillow 0–255 array
         # ------------------------------------------------------------
-        uv_layer_names = {uv.name for uv in obj.data.uv_layers}
-        use_lightmap_uv = "LightMap" in uv_layer_names
-        if not use_lightmap_uv:
-            print("⚠ No 'LightMap' UV found on", obj.name, "- Divide will use default UVs")
+        C = (np.array(self.img_combined.pixels[:])
+            .reshape(h, w, 4)[:, :, :3] * 255).astype(np.float32)
+        A = (np.array(self.img_albedo.pixels[:])
+            .reshape(h, w, 4)[:, :, :3] * 255).astype(np.float32)
 
-        bake_img = self.img_final
+        # Photoshop: avoid divide by zero by clamping denominator to 1
+        A = np.clip(A, 1.0, 255.0)
 
-        # ============================================================
-        # 1. Override materials with Divide → Emission
-        # ============================================================
-        for mat in self._materials():
-            nt = mat.node_tree
-            nodes = nt.nodes
-            links = nt.links
+        # ------------------------------------------------------------
+        # Photoshop Divide: Base / Blend
+        # ------------------------------------------------------------
+        result = C / A  # float division in 0..1 range
 
-            # Find material output
-            out = self._find_output(mat)
-            if not out:
-                continue
+        # Clamp to valid range
+        result = np.clip(result, 0.0, 1.0)
 
-            # Backup original Surface links
-            orig_links = [(l.from_node, l.from_socket) for l in out.inputs["Surface"].links]
-            link_backup.append((mat, out, orig_links))
+        # Convert to RGBA float16 for Blender
+        rgba = np.ones((h, w, 4), dtype=np.float32)
+        rgba[:, :, :3] = result
 
-            # Remove original Surface links
-            for l in list(out.inputs["Surface"].links):
-                links.remove(l)
+        # Store in Blender image
+        self.img_final.pixels = rgba.reshape(-1).tolist()
 
-            # ---------------- UV node ----------------
-            uv_node = None
-            if use_lightmap_uv:
-                uv_node = nodes.new("ShaderNodeUVMap")
-                uv_node.uv_map = "LightMap"
-                uv_node.label = "LM UV"
-                uv_node.location = (-800, 40)
-                nt_created.append((mat, uv_node))
-
-            # ---------------- Textures ----------------
-            tex_C = nodes.new("ShaderNodeTexImage")  # Combined
-            tex_C.image = self.img_combined
-            tex_C.label = "LM Combined"
-            tex_C.interpolation = 'Linear'
-            tex_C.location = (-600, 140)
-            nt_created.append((mat, tex_C))
-
-            tex_A = nodes.new("ShaderNodeTexImage")  # Albedo
-            tex_A.image = self.img_albedo
-            tex_A.label = "LM Albedo"
-            tex_A.interpolation = 'Linear'
-            tex_A.location = (-600, -40)
-            nt_created.append((mat, tex_A))
-
-            # Feed LightMap UV into both textures
-            if uv_node is not None:
-                links.new(uv_node.outputs["UV"], tex_C.inputs["Vector"])
-                links.new(uv_node.outputs["UV"], tex_A.inputs["Vector"])
-
-            # ---------------- Divide mix ----------------
-            mix = nodes.new("ShaderNodeMixRGB")
-            mix.blend_type = "DIVIDE"
-            mix.inputs["Fac"].default_value = 1.0
-            mix.location = (-300, 40)
-            mix.label = "Combined / Albedo"
-            nt_created.append((mat, mix))
-
-            # Combined → Color1, Albedo → Color2
-            links.new(tex_C.outputs["Color"], mix.inputs["Color1"])
-            links.new(tex_A.outputs["Color"], mix.inputs["Color2"])
-
-            # ---------------- Emission + Output ----------------
-            emit = nodes.new("ShaderNodeEmission")
-            emit.location = (-50, 40)
-            emit.label = "Divide Emit"
-            nt_created.append((mat, emit))
-
-            links.new(mix.outputs["Color"], emit.inputs["Color"])
-            links.new(emit.outputs["Emission"], out.inputs["Surface"])
-
-            # ---------------- Bake Target node ----------------
-            tex_bake = nodes.new("ShaderNodeTexImage")
-            tex_bake.image = bake_img
-            tex_bake.label = "Bake Target"
-            tex_bake.location = (150, -120)
-            nt_created.append((mat, tex_bake))
-
-            nt.nodes.active = tex_bake
-
-        # ============================================================
-        # 2. Bake EMIT (Divide result) into self.img_final
-        # ============================================================
-        with bpy.context.temp_override(
-            object=obj,
-            active_object=obj,
-            selected_objects=[obj],
-            selected_editable_objects=[obj],
-        ):
-            bpy.ops.object.bake(
-                type='EMIT',
-                margin=4,
-                use_clear=True
-            )
-
-        # ============================================================
-        # 3. Restore original materials & clean up nodes
-        # ============================================================
-        for mat, out, orig_links in link_backup:
-            nt = mat.node_tree
-            links = nt.links
-
-            # Remove our temporary EMIT links
-            for l in list(out.inputs["Surface"].links):
-                links.remove(l)
-
-            # Restore original links
-            for from_node, from_socket in orig_links:
-                links.new(from_socket, out.inputs["Surface"])
-
-        # Delete all temp nodes we created
-        for mat, node in nt_created:
-            try:
-                mat.node_tree.nodes.remove(node)
-            except:
-                pass
-
-        print("✔ Divide bake complete (LightMap UV linked)")
+        # Continue with compositing pipeline
+        composite_blurred_mask(self.img_final, self.img_mask)
 
 
 def _debug_save_image(arr, stepname): #turned off rn
@@ -1027,7 +767,13 @@ def rebuild_groups_after_pipeline(finished_jobs):
         group = scene.my_items.add()
         group.name = f"Lightgroup {len(scene.my_items)}"
 
-        for obj in sep_objects:
+        for name in sep_objects:
+            obj = bpy.data.objects.get(name)
+            if obj is None:
+                continue
+            if obj.as_pointer() == 0:
+                continue
+
             entry = group.objects.add()
             entry.obj = obj
             baked_object.append(obj)
@@ -1055,54 +801,18 @@ def ensure_lightmap_uv(mesh_object):
     return uv_layer
 
 def smart_uv_unwrap(mesh_object):
-    """Safely unwrap UVs. Should be called from within a temp_override context."""
-    # Ensure object is active (should already be set by caller, but double-check)
-    if bpy.context.view_layer.objects.active != mesh_object:
-        bpy.context.view_layer.objects.active = mesh_object
-    mesh_object.select_set(True)
-    
     # Must be in edit mode, mesh selected
-    ensure_object_mode_is('EDIT')
-    
-    # Ensure we're still in the right context before calling mesh operators
-    if bpy.context.active_object != mesh_object:
-        bpy.context.view_layer.objects.active = mesh_object
-    
-    try:
-        bpy.ops.mesh.select_all(action='SELECT')
-    except (RuntimeError, AttributeError):
-        # Context issue - try to recover
-        ensure_object_mode_is('OBJECT')
-        bpy.context.view_layer.objects.active = mesh_object
-        ensure_object_mode_is('EDIT')
-        bpy.ops.mesh.select_all(action='SELECT')
+    bpy.context.view_layer.objects.active = mesh_object
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
 
-    # Ensure object is active before calling UV operators
-    if bpy.context.active_object != mesh_object:
-        bpy.context.view_layer.objects.active = mesh_object
-    
-    try:
-        bpy.ops.uv.smart_project(
-            angle_limit=math.radians(66),   # 66° like the UI
-            island_margin=0.005,
-            area_weight=0.0,
-            correct_aspect=True,
-            scale_to_bounds=True,
-        )
-    except (RuntimeError, AttributeError):
-        # Context issue - ensure object is active and try again
-        bpy.context.view_layer.objects.active = mesh_object
-        ensure_object_mode_is('EDIT')
-        bpy.ops.uv.smart_project(
-            angle_limit=math.radians(66),   # 66° like the UI
-            island_margin=0.005,
-            area_weight=0.0,
-            correct_aspect=True,
-            scale_to_bounds=True,
-        )
-
-    ensure_object_mode_is('OBJECT')
-
+    bpy.ops.uv.smart_project(
+        angle_limit=math.radians(66),   # 66° like the UI
+        island_margin=0.001,
+        area_weight=0.0,
+        correct_aspect=True,
+        scale_to_bounds=True,
+    )
 
     bpy.ops.object.mode_set(mode='OBJECT')
 
@@ -1152,23 +862,9 @@ def assign_lightmap_to_materials(mesh_object, baked_image):
         slot_index += 1
 
 def ensure_object_mode_is(mode_name):
-    """Safely ensure the active object is in the specified mode."""
-    obj = bpy.context.active_object
-    if obj is None:
-        return  # No active object, can't set mode
-    
-    # Check if already in the correct mode
-    if obj.mode == mode_name:
-        return
-    
-    # Only switch modes if necessary
-    try:
+    current_mode = bpy.context.object.mode
+    if current_mode != mode_name:
         bpy.ops.object.mode_set(mode=mode_name)
-    except (RuntimeError, AttributeError) as e:
-        # Mode switch failed, likely due to context issues
-        # This can happen when called from timers or invalid contexts
-        # Just return - the mode might already be correct or we can't change it
-        pass
 
 def make_object_active_and_selected(target_object):
     bpy.ops.object.select_all(action="DESELECT")
@@ -1204,113 +900,62 @@ def combine(selected_objects, ops=None):
     ctx = view3d_override()
 
     with bpy.context.temp_override(**ctx):
-        for i, mesh_object in enumerate(selected_objects):
+        for mesh_object in selected_objects:
             make_object_active_and_selected(mesh_object)
 
             # Switch to EDIT and select all
             ensure_object_mode_is('EDIT')
-            
-            # Double-check object is active before calling mesh operators
-            if bpy.context.active_object != mesh_object:
-                bpy.context.view_layer.objects.active = mesh_object
-            
-            try:
-                bpy.ops.mesh.select_all(action='SELECT')
-            except (RuntimeError, AttributeError):
-                # Context issue - ensure object is active and try again
-                bpy.context.view_layer.objects.active = mesh_object
-                ensure_object_mode_is('EDIT')
-                bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.mesh.select_all(action='SELECT')
 
             # Back to OBJECT
             ensure_object_mode_is('OBJECT')
 
             # Build vertex group name
-            if len(mesh_object.material_slots) > 0 and mesh_object.material_slots[0].material is not None:
-                material_name = mesh_object.material_slots[0].material.name
+            real_mat = mesh_object.active_material
+            if real_mat:
+                material_name = real_mat.name
             else:
                 material_name = "Material"
 
-            vertex_group_name = mesh_object.name + VERTEX_GROUP_SPLITTER + material_name
+            vertex_group_name = f"{mesh_object.name}{VERTEX_GROUP_SPLITTER}{material_name}"
+
+            print(f"VERTEX_GROUP {vertex_group_name}")
+
             vertex_group_reference = mesh_object.vertex_groups.get(vertex_group_name)
             if vertex_group_reference is None:
                 vertex_group_reference = mesh_object.vertex_groups.new(name=vertex_group_name)
-            else:
-                pass
 
             # Add all vertices to group
             all_vertex_indices = [v.index for v in mesh_object.data.vertices]
             if all_vertex_indices:
                 vertex_group_reference.add(all_vertex_indices, 1.0, 'ADD')
-            else:
-                pass
 
         # Join phase
-        # Ensure we're in OBJECT mode before joining
-        ensure_object_mode_is('OBJECT')
-        
-        # Ensure first object is active before deselecting
-        if bpy.context.active_object != selected_objects[0]:
-            bpy.context.view_layer.objects.active = selected_objects[0]
-        
-        try:
-            bpy.ops.object.select_all(action="DESELECT")
-        except (RuntimeError, AttributeError):
-            # Context issue - ensure object is active and try again
-            bpy.context.view_layer.objects.active = selected_objects[0]
-            bpy.ops.object.select_all(action="DESELECT")
-        
+        bpy.ops.object.select_all(action="DESELECT")
         for mesh_object in selected_objects:
             mesh_object.select_set(True)
 
         bpy.context.view_layer.objects.active = selected_objects[0]
-        
-        # Ensure object is active before joining
-        if bpy.context.active_object != selected_objects[0]:
-            bpy.context.view_layer.objects.active = selected_objects[0]
-        
-        try:
-            bpy.ops.object.join()
-        except (RuntimeError, AttributeError):
-            # Context issue - ensure object is active and try again
-            bpy.context.view_layer.objects.active = selected_objects[0]
-            for mesh_object in selected_objects:
-                mesh_object.select_set(True)
-            bpy.ops.object.join()
+
+        bpy.ops.object.join()
 
         active_obj = bpy.context.view_layer.objects.active
 
     return active_obj
 
 def seperate(active_object: bpy.types.Object, ops=None):
-    if active_object is None or active_object.type != "MESH":
-        if ops is not None:
-            ops.report({'ERROR'}, "Select a mesh that contains vertex groups.")
-        return []
-    
     ctx = view3d_override()
 
     with bpy.context.temp_override(**ctx):
-        # Ensure the object is active in this context
-        bpy.context.view_layer.objects.active = active_object
-        active_object.select_set(True)
-        
-        original_name = active_object.name
         active_object.name = "SPLITTING OBJECT"
 
+        if active_object is None or active_object.type != "MESH":
+            if ops is not None:
+                ops.report({'ERROR'}, "Select a mesh that contains vertex groups.")
+            return {'CANCELLED'}
+
         ensure_object_mode_is('EDIT')
-        
-        # Ensure object is active before calling mesh operators
-        if bpy.context.active_object != active_object:
-            bpy.context.view_layer.objects.active = active_object
-        
-        try:
-            bpy.ops.mesh.select_mode(use_extend=False, use_expand=False, type='VERT')
-        except (RuntimeError, AttributeError):
-            # Context issue - ensure object is active and try again
-            bpy.context.view_layer.objects.active = active_object
-            ensure_object_mode_is('EDIT')
-            bpy.ops.mesh.select_mode(use_extend=False, use_expand=False, type='VERT')
+        bpy.ops.mesh.select_mode(use_extend=False, use_expand=False, type='VERT')
         ensure_object_mode_is('OBJECT')
 
         vertex_groups_to_process = []
@@ -1318,9 +963,8 @@ def seperate(active_object: bpy.types.Object, ops=None):
             vertex_groups_to_process.append(vg)
 
         og_object_list = []
-        for i, vertex_group in enumerate(vertex_groups_to_process):
+        for vertex_group in vertex_groups_to_process:
             vertex_group_name = vertex_group.name
-            
             if VERTEX_GROUP_SPLITTER not in vertex_group_name:
                 continue
 
@@ -1328,19 +972,7 @@ def seperate(active_object: bpy.types.Object, ops=None):
 
             # Deselect all
             ensure_object_mode_is('EDIT')
-            
-            # Ensure object is active before calling mesh operators
-            if bpy.context.active_object != active_object:
-                bpy.context.view_layer.objects.active = active_object
-            
-            try:
-                bpy.ops.mesh.select_all(action='DESELECT')
-            except (RuntimeError, AttributeError):
-                # Context issue - ensure object is active and try again
-                bpy.context.view_layer.objects.active = active_object
-                ensure_object_mode_is('EDIT')
-                bpy.ops.mesh.select_all(action='DESELECT')
-            
+            bpy.ops.mesh.select_all(action='DESELECT')
             ensure_object_mode_is('OBJECT')
 
             # Select vertices belonging to group
@@ -1356,19 +988,7 @@ def seperate(active_object: bpy.types.Object, ops=None):
             active_object.data.update()
 
             ensure_object_mode_is('EDIT')
-            
-            # Ensure object is active before calling mesh operators
-            if bpy.context.active_object != active_object:
-                bpy.context.view_layer.objects.active = active_object
-            
-            try:
-                bpy.ops.mesh.separate(type='SELECTED')
-            except (RuntimeError, AttributeError):
-                # Context issue - ensure object is active and try again
-                bpy.context.view_layer.objects.active = active_object
-                ensure_object_mode_is('EDIT')
-                bpy.ops.mesh.separate(type='SELECTED')
-            
+            bpy.ops.mesh.separate(type='SELECTED')
             ensure_object_mode_is('OBJECT')
 
             newly_created_objects = []
@@ -1377,6 +997,7 @@ def seperate(active_object: bpy.types.Object, ops=None):
                     newly_created_objects.append(o)
 
             if not newly_created_objects:
+                print("WARNING: mesh.separate() created no new object for", vertex_group_name)
                 continue
 
             new_obj = newly_created_objects[-1]
@@ -1388,63 +1009,27 @@ def seperate(active_object: bpy.types.Object, ops=None):
 
             new_obj.name = original_object_name
 
-            
-            # CRITICAL FIX: Get material from separated faces, not by name lookup
-            # After ensure_unique_material(), materials are renamed, so name lookup fails
-            # The separated faces should already have the correct material_index from the combined object
-            mat = None
-            
-            # First, check if faces have a material_index assigned
-            if len(new_obj.data.polygons) > 0:
-                # Get the material_index from the first face (all faces in this group should have the same)
-                first_face_mat_index = new_obj.data.polygons[0].material_index
-                
-                # Get the material from the combined object's material slots using this index
-                if first_face_mat_index < len(active_object.material_slots):
-                    mat_slot = active_object.material_slots[first_face_mat_index]
-                    mat = mat_slot.material
-            
-            # Fallback: Try to find by original name
+            new_obj.data.materials.clear()
+            # First try to find exact match
+            mat = bpy.data.materials.get(original_material_name)
+
+            # If not found, try unique variant
             if mat is None:
-                mat = bpy.data.materials.get(original_material_name)
-                if mat:
-                    pass
-            
-            # Fallback 2: Try to find by unique name pattern
-            if mat is None:
-                # Look for materials that start with the original name (for unique materials)
-                for material in bpy.data.materials:
-                    if material.name.startswith(original_material_name + "_unique_"):
-                        mat = material
-                        break
-            
+                unique_name = f"{original_material_name}_unique_{original_object_name}"
+                mat = bpy.data.materials.get(unique_name)
+
             if mat:
-                new_obj.data.materials.clear()
                 new_obj.data.materials.append(mat)
-                
-                # CRITICAL FIX: Assign material to all faces
-                # When separating, faces lose their material assignment
-                # We need to set material_index on all faces to 0 (the first/only slot)
-                face_count = len(new_obj.data.polygons)
-                for face in new_obj.data.polygons:
-                    face.material_index = 0
-                
-                # Set the active material slot to ensure it's properly linked
-                if len(new_obj.material_slots) > 0:
-                    new_obj.active_material_index = 0
 
             new_obj.vertex_groups.clear()
 
-            og_object_list.append(new_obj)
+
+            og_object_list.append(new_obj.name)
 
         bpy.data.objects.remove(active_object, do_unlink=True)
 
-        for i, obj in enumerate(og_object_list):
-            pass
-
         if ops is not None:
             ops.report({'INFO'}, "Meshes successfully restored.")
-
 
     return og_object_list
 
@@ -1453,148 +1038,88 @@ def seperate(active_object: bpy.types.Object, ops=None):
 ###########
 
 def preview_object(object: bpy.types.Object, preview=True):
-    # Skip non-MESH objects (lights, cameras, etc.)
-    if object.type != "MESH":
+    mat = object.active_material
+    if not mat:
         return
-    
-    # Process ALL material slots for this object (objects can have multiple materials)
-    if not object.material_slots or len(object.material_slots) == 0:
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+
+    bsdf = None
+    for n in nodes:
+        if n.type == "BSDF_PRINCIPLED":
+            bsdf = n
+            break
+
+
+    base_input = bsdf.inputs["Base Color"]
+    emit_input = bsdf.inputs["Emission Color"]
+
+    # If nothing is linked to Base Color, do nothing
+    if not base_input.is_linked:
         return
-    
-    
-    # Process each material slot on this object
-    materials_processed = 0
-    for slot_idx, slot in enumerate(object.material_slots):
-        if slot is None:
-            continue
-            
-        mat = slot.material
-        if mat is None:
-            continue
-        
-        if not mat.use_nodes:
-            continue
-        
-        nodes = mat.node_tree.nodes
-        links = mat.node_tree.links
 
-        bsdf = None
-        for n in nodes:
-            if n.type == "BSDF_PRINCIPLED":
-                bsdf = n
-                break
+    # The current link into BSDF Base Color
+    old_link = base_input.links[0]
+    from_sock = old_link.from_socket
+    linked_node = from_sock.node
 
-        if bsdf is None:
-            continue
+    # ----------------------------------------------------------
+    # CASE 1: preview=False AND BaseColor is already MixRGB
+    # → REMOVE the MixRGB and restore original image
+    # ----------------------------------------------------------
+    if linked_node.type == "MIX_RGB" and preview == False:
+        mix_node = linked_node
 
-        base_input = bsdf.inputs.get("Base Color")
-        emit_input = bsdf.inputs.get("Emission Color")
-        
-        if base_input is None or emit_input is None:
-            continue
+        # Get the original color1 texture socket
+        orig_sock = mix_node.inputs["Color1"].links[0].from_socket
 
-        # If nothing is linked to Base Color, do nothing
-        if not base_input.is_linked:
-            continue
+        # Remove mix node connection to BSDF
+        links.remove(old_link)
 
-        # The current link into BSDF Base Color
-        old_link = base_input.links[0]
-        if old_link is None:
-            continue
-        
-        from_sock = old_link.from_socket
-        if from_sock is None:
-            continue
-        
-        linked_node = from_sock.node
-        if linked_node is None:
-            continue
+        # Restore original texture directly to Base Color
+        links.new(orig_sock, base_input)
 
-        # ----------------------------------------------------------
-        # CASE 1: preview=False AND BaseColor is already MixRGB
-        # → REMOVE the MixRGB and restore original image
-        # ----------------------------------------------------------
-        if linked_node.type == "MIX_RGB" and preview == False:
-            mix_node = linked_node
+        # Optional: delete the mix node
+        nodes.remove(mix_node)
 
-            # Get the original color1 texture socket
-            if not mix_node.inputs["Color1"].is_linked:
-                # MixRGB Color1 not linked, just remove the mix node
-                links.remove(old_link)
-                nodes.remove(mix_node)
-                continue
-            
-            orig_sock = mix_node.inputs["Color1"].links[0].from_socket
+        return  # restoration complete
 
-            # Remove mix node connection to BSDF
-            links.remove(old_link)
 
-            # Restore original texture directly to Base Color
-            links.new(orig_sock, base_input)
+    # ----------------------------------------------------------
+    # CASE 2: preview=True AND BaseColor is a plain Image Texture
+    # → INSERT a MixRGB that uses the Emission texture
+    # ----------------------------------------------------------
+    if linked_node.type == "TEX_IMAGE" and preview == True:
 
-            # Optional: delete the mix node
-            nodes.remove(mix_node)
-            materials_processed += 1
+        # Create MixRGB
+        mix_RGB = nodes.new("ShaderNodeMixRGB")
+        mix_RGB.location = (
+            (linked_node.location.x + bsdf.location.x) / 2,
+            linked_node.location.y - 80
+        )
 
-            continue  # restoration complete for this material
+        # Mix mode = Multiply
+        mix_RGB.blend_type = "MULTIPLY"
 
-        # ----------------------------------------------------------
-        # CASE 2: preview=True AND BaseColor is already MixRGB
-        # → Ensure emission is connected to Color2 (may already be set up)
-        # ----------------------------------------------------------
-        if linked_node.type == "MIX_RGB" and preview == True:
-            mix_node = linked_node
-            
-            # Ensure emission is connected to Color2 if available
-            if emit_input.is_linked:
-                em_link = emit_input.links[0]
-                em_node = em_link.from_socket.node
+        # Factor = 1.0
+        mix_RGB.inputs["Fac"].default_value = 1.0
 
-                if em_node.type == "TEX_IMAGE":
-                    # Check if Color2 is already connected
-                    if not mix_node.inputs["Color2"].is_linked:
-                        links.new(em_link.from_socket, mix_node.inputs["Color2"])
-            
-            materials_processed += 1
-            continue  # already in preview mode
+        # Remove direct link (image → bsdf)
+        links.remove(old_link)
 
-        # ----------------------------------------------------------
-        # CASE 3: preview=True AND BaseColor is a plain Image Texture
-        # → INSERT a MixRGB that uses the Emission texture
-        # ----------------------------------------------------------
-        if linked_node.type == "TEX_IMAGE" and preview == True:
-            # Create MixRGB
-            mix_RGB = nodes.new("ShaderNodeMixRGB")
-            mix_RGB.location = (
-                (linked_node.location.x + bsdf.location.x) / 2,
-                linked_node.location.y - 80
-            )
+        # Connect base texture → Color1
+        links.new(from_sock, mix_RGB.inputs["Color1"])
 
-            # Mix mode = Multiply
-            mix_RGB.blend_type = "MULTIPLY"
+        # If emission is linked, plug into Color2
+        if emit_input.is_linked:
+            em_link = emit_input.links[0]
+            em_node = em_link.from_socket.node
 
-            # Factor = 1.0
-            mix_RGB.inputs["Fac"].default_value = 1.0
+            if em_node.type == "TEX_IMAGE":
+                links.new(em_link.from_socket, mix_RGB.inputs["Color2"])
 
-            # Remove direct link (image → bsdf)
-            links.remove(old_link)
-
-            # Connect base texture → Color1
-            links.new(from_sock, mix_RGB.inputs["Color1"])
-
-            # If emission is linked, plug into Color2
-            if emit_input.is_linked:
-                em_link = emit_input.links[0]
-                em_node = em_link.from_socket.node
-
-                if em_node.type == "TEX_IMAGE":
-                    links.new(em_link.from_socket, mix_RGB.inputs["Color2"])
-
-            # Output of MixRGB → BSDF Base Color
-            links.new(mix_RGB.outputs["Color"], base_input)
-            materials_processed += 1
-        # Node type doesn't match any expected case
-        # Don't increment materials_processed since we didn't process it
+        # Output of MixRGB → BSDF Base Color
+        links.new(mix_RGB.outputs["Color"], base_input)
 
 def rebuild_baked_mat_list():
     all_objects = bpy.context.selectable_objects
@@ -1607,7 +1132,7 @@ def rebuild_baked_mat_list():
 
             mat = obj.active_material
             if not mat:
-                continue
+                return
             nodes = mat.node_tree.nodes
             links = mat.node_tree.links
 
@@ -1627,9 +1152,8 @@ def rebuild_baked_mat_list():
                     img = em_node.image
                     filename = os.path.basename(img.filepath)
 
-                    if ("lightmap_Lightgroup" in filename) or "LM_Final_" in filename:
+                    if "lightmap_Lightgroup" in filename:
                         baked_object.append(obj)
-                        print(filename)
 
 def preview_init_check():
     rebuild_baked_mat_list()
@@ -1639,11 +1163,6 @@ def preview_init_check():
     props = bpy.context.scene.lgx_preview_props
     if len(baked_object) != 0:
         mat = baked_object[0].active_material
-        if mat is None or not mat.use_nodes:
-            props.disable_preview_off = True   
-            props.disable_preview_on = True
-            return
-        
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
 
@@ -1653,21 +1172,11 @@ def preview_init_check():
                 bsdf = n
                 break
 
-        if bsdf is None:
-            props.disable_preview_off = True   
-            props.disable_preview_on = True
-            return
 
-        base_input = bsdf.inputs.get("Base Color")
-        if base_input is None:
-            props.disable_preview_off = True   
-            props.disable_preview_on = True
-            return
+        base_input = bsdf.inputs["Base Color"]
 
         # If nothing is linked to Base Color, do nothing
         if not base_input.is_linked:
-            props.disable_preview_off = True   
-            props.disable_preview_on = True
             return
 
         # The current link into BSDF Base Color
@@ -1698,9 +1207,6 @@ def remove_lightmaps():
         preview_object(obj, preview=False)
 
         mat = obj.active_material
-        if mat is None or not mat.use_nodes:
-            continue
-        
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
         bsdf = None
@@ -1709,12 +1215,8 @@ def remove_lightmaps():
                 bsdf = n
                 break
 
-        if bsdf is None:
-            continue
 
-        emit_input = bsdf.inputs.get("Emission Color")
-        if emit_input is None:
-            continue
+        emit_input = bsdf.inputs["Emission Color"]
 
         if emit_input.is_linked:
             em_link = emit_input.links[0]
@@ -1785,6 +1287,8 @@ def ensure_unique_material(obj):
     obj.active_material = new_mat
 
     print(f"✔ {obj.name} now uses its own material: {new_mat.name}")
+
+
 
 
 class LGX_bake_samples(bpy.types.PropertyGroup):
@@ -1890,19 +1394,6 @@ class LGX_UL_mylist(bpy.types.UIList):
         elif self.layout_type in {'GRID'}:
             layout.alignment = 'CENTER'
             layout.label(text="")
-
-class LGX_delete_lightmap_groups(bpy.types.Operator):
-    bl_idname = "lgx.del_lightmap"
-    bl_label = "delete groups"
-    
-    def execute(self, context):
-        scene = context.scene
-        for group_idx in range(len(scene.my_items)):
-            scene.my_items.remove(group_idx)
-
-        scene.my_items_index = 0
-
-        return {"FINISHED"}
 
 class LGX_OT_add_item(bpy.types.Operator):
     bl_idname = "lgx.add_item"
@@ -2169,6 +1660,7 @@ class LGX_remove_lightmaps(bpy.types.Operator):
 
         return {'FINISHED'}
     
+    
 
 #debug preview
 class LGX_preview_on(bpy.types.Operator):
@@ -2209,15 +1701,6 @@ class LGX_ensure_unique(bpy.types.Operator):
 
         return {"FINISHED"}
 
-class LGX_debug_rebuild(bpy.types.Operator):
-    bl_idname = "lgx.dbg_rebuild"
-    bl_label = ""
-
-    def execute(self, context):
-        rebuild_baked_mat_list()
-        
-        return {"FINISHED"}
-
 #panels
 class LGX_PT_panel(bpy.types.Panel):
     bl_label = "LumaxGL"
@@ -2238,7 +1721,6 @@ class LGX_PT_panel(bpy.types.Panel):
         row = box.row()
         box.operator("lgx.lightmap_groups_generator", icon="ZOOM_SELECTED", text="Generate Groups")
         box.prop(context.scene.lgx_group_generator_count, "count")
-        box.operator("lgx.del_lightmap", icon="KEY_BACKSPACE_FILLED")
 
 
         box.template_list(
@@ -2314,8 +1796,6 @@ class LGX_PT_debug(bpy.types.Panel):
         layout.label(text=f"render res = {context.scene.lgx_render_resolution.value}")
 
         layout.operator("lgx.ensure_unique", text = "unique")
-
-        layout.operator("lgx.dbg_rebuild", text="rebuild mats")
         box = layout.box()
 
         box.label(text="preview_objects")
@@ -2327,7 +1807,6 @@ class LGX_PT_debug(bpy.types.Panel):
 
 
 classes = [
-    LGX_delete_lightmap_groups,
     LGX_bake_samples,
     LGX_ensure_unique,
     LGX_remove_lightmaps,
@@ -2357,9 +1836,8 @@ classes = [
 ]
 
 debug_classes = [
-    LGX_OT_UV_uwrap_uvs,
-    LGX_debug_rebuild,
-    LGX_PT_debug
+    LGX_PT_debug,
+    LGX_OT_UV_uwrap_uvs
 ]
 
 if DEBUG == True:
