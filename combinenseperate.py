@@ -213,6 +213,7 @@ def _process_bake_queue():
                 callback(img, lightmap_group)
         except Exception as e:
             print("Lightmap bake failed:", e)
+            raise(e)
 
         is_baking = False
         return None  # finish this bake
