@@ -237,7 +237,8 @@ class LightmapBaker:
         self._bake_combined()
         self._bake_albedo()
         self._bake_mask()
-        self._divide()
+        max_range = bpy.context.scene.lgx_render_light_level.value
+        self._divide(max_range=max_range)
         return self.img_final
 
     def _ensure_cycles(self):
@@ -383,6 +384,9 @@ class LightmapBaker:
             overrides.append((mat, out, emit, orig_links))
         self._bake("EMIT", self.img_albedo)
 
+
+
+
         for mat, out, emit, orig_links in overrides:
             nt = mat.node_tree
             links = nt.links
@@ -473,41 +477,164 @@ class LightmapBaker:
 
         print("✔ Mask bake complete (direct alpha mask).")
 
-    def _divide(self):
+    def _divide(self, max_range=3.5):
         """
-        Photoshop-accurate Divide blend mode using pure Pillow operations.
-        Result = clamp(Base / max(Blend, 1), 0–1)
+        Perform Photoshop-style Divide (Combined / Albedo) using shader nodes
+        directly on the baked object, using the 'LightMap' UV set.
         """
 
-        w, h = self.img_combined.size
+        obj = self.obj
+        nt_created = []   # store (mat, node) for cleanup
+        link_backup = []  # (mat, out, orig_links)
 
         # ------------------------------------------------------------
-        # Convert Blender float image → Pillow 0–255 array
+        # Sanity: check LightMap UV exists on this mesh
         # ------------------------------------------------------------
-        C = (np.array(self.img_combined.pixels[:])
-            .reshape(h, w, 4)[:, :, :3] * 255).astype(np.float32)
-        A = (np.array(self.img_albedo.pixels[:])
-            .reshape(h, w, 4)[:, :, :3] * 255).astype(np.float32)
+        uv_layer_names = {uv.name for uv in obj.data.uv_layers}
+        use_lightmap_uv = "LightMap" in uv_layer_names
+        if not use_lightmap_uv:
+            print("⚠ No 'LightMap' UV found on", obj.name, "- Divide will use default UVs")
 
-        # Photoshop: avoid divide by zero by clamping denominator to 1
-        A = np.clip(A, 1.0, 255.0)
+        bake_img = self.img_final
 
-        # ------------------------------------------------------------
-        # Photoshop Divide: Base / Blend
-        # ------------------------------------------------------------
-        result = C / A  # float division in 0..1 range
+        # ============================================================
+        # 1. Override materials with Divide → Emission
+        # ============================================================
+        for mat in self._materials():
+            nt = mat.node_tree
+            nodes = nt.nodes
+            links = nt.links
 
-        # Clamp to valid range
-        result = np.clip(result, 0.0, 1.0)
+            # Find material output
+            out = self._find_output(mat)
+            if not out:
+                continue
 
-        # Convert to RGBA float16 for Blender
-        rgba = np.ones((h, w, 4), dtype=np.float32)
-        rgba[:, :, :3] = result
+            # Backup original Surface links
+            orig_links = [(l.from_node, l.from_socket) for l in out.inputs["Surface"].links]
+            link_backup.append((mat, out, orig_links))
 
-        # Store in Blender image
-        self.img_final.pixels = rgba.reshape(-1).tolist()
+            # Remove original Surface links
+            for l in list(out.inputs["Surface"].links):
+                links.remove(l)
 
-        # Continue with compositing pipeline
+            # ---------------- UV node ----------------
+            uv_node = None
+            if use_lightmap_uv:
+                uv_node = nodes.new("ShaderNodeUVMap")
+                uv_node.uv_map = "LightMap"
+                uv_node.label = "LM UV"
+                uv_node.location = (-800, 40)
+                nt_created.append((mat, uv_node))
+
+            # ---------------- Textures ----------------
+            tex_C = nodes.new("ShaderNodeTexImage")  # Combined
+            tex_C.image = self.img_combined
+            tex_C.label = "LM Combined"
+            tex_C.interpolation = 'Linear'
+            tex_C.location = (-600, 140)
+            nt_created.append((mat, tex_C))
+
+            tex_A = nodes.new("ShaderNodeTexImage")  # Albedo
+            tex_A.image = self.img_albedo
+            tex_A.label = "LM Albedo"
+            tex_A.interpolation = 'Linear'
+            tex_A.location = (-600, -40)
+            nt_created.append((mat, tex_A))
+
+            # Feed LightMap UV into both textures
+            if uv_node is not None:
+                links.new(uv_node.outputs["UV"], tex_C.inputs["Vector"])
+                links.new(uv_node.outputs["UV"], tex_A.inputs["Vector"])
+
+            # ---------------- Divide mix ----------------
+            mix = nodes.new("ShaderNodeMixRGB")
+            mix.blend_type = "DIVIDE"
+            mix.inputs["Fac"].default_value = 1.0
+            mix.location = (-300, 40)
+            mix.label = "Combined / Albedo"
+            nt_created.append((mat, mix))
+
+            # Combined → Color1, Albedo → Color2
+            links.new(tex_C.outputs["Color"], mix.inputs["Color1"])
+            links.new(tex_A.outputs["Color"], mix.inputs["Color2"])
+
+            # ---------------- Map Range (HDR → 0–1, VECTOR) ----------------
+            map_range = nodes.new("ShaderNodeMapRange")
+            map_range.label = f"MapRange 0-{max_range} → 0-1"
+            map_range.location = (-120, 40)
+
+            # IMPORTANT: operate on RGB vector, not scalar
+            map_range.data_type = 'FLOAT_VECTOR'
+            map_range.clamp = False
+
+            # From / To ranges
+            map_range.inputs["From Min"].default_value = (0.0, 0.0, 0.0)
+            map_range.inputs["From Max"].default_value = (max_range, max_range, max_range)
+            map_range.inputs["To Min"].default_value = (0.0, 0.0, 0.0)
+            map_range.inputs["To Max"].default_value = (1.0, 1.0, 1.0)
+
+            nt_created.append((mat, map_range))
+
+            links.new(mix.outputs["Color"], map_range.inputs["Vector"])
+
+
+            # ---------------- Emission + Output ----------------
+            emit = nodes.new("ShaderNodeEmission")
+            emit.location = (60, 40)
+            emit.label = "Divide Emit"
+            nt_created.append((mat, emit))
+
+            links.new(map_range.outputs["Vector"], emit.inputs["Color"])
+            links.new(emit.outputs["Emission"], out.inputs["Surface"])
+
+            # ---------------- Bake Target node ----------------
+            tex_bake = nodes.new("ShaderNodeTexImage")
+            tex_bake.image = bake_img
+            tex_bake.label = "Bake Target"
+            tex_bake.location = (150, -120)
+            nt_created.append((mat, tex_bake))
+
+            nt.nodes.active = tex_bake
+
+        # ============================================================
+        # 2. Bake EMIT (Divide result) into self.img_final
+        # ============================================================
+        with bpy.context.temp_override(
+            object=obj,
+            active_object=obj,
+            selected_objects=[obj],
+            selected_editable_objects=[obj],
+        ):
+            bpy.ops.object.bake(
+                type='EMIT',
+                margin=4,
+                use_clear=True
+            )
+
+        # ============================================================
+        # 3. Restore original materials & clean up nodes
+        # ============================================================
+        for mat, out, orig_links in link_backup:
+            nt = mat.node_tree
+            links = nt.links
+
+            # Remove our temporary EMIT links
+            for l in list(out.inputs["Surface"].links):
+                links.remove(l)
+
+            # Restore original links
+            for from_node, from_socket in orig_links:
+                links.new(from_socket, out.inputs["Surface"])
+
+        # Delete all temp nodes we created
+        for mat, node in nt_created:
+            try:
+                mat.node_tree.nodes.remove(node)
+            except:
+                pass
+
+        print("✔ Divide bake complete (LightMap UV linked)")
         composite_blurred_mask(self.img_final, self.img_mask)
 
 
@@ -580,6 +707,7 @@ def composite_blurred_mask(final_img, mask_img,
     w, h = final_img.size
 
     final = np.array(final_img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+
 
     mask = np.array(mask_img.pixels[:], dtype=np.float32).reshape(h, w, 4)
 
@@ -690,6 +818,26 @@ def composite_blurred_mask(final_img, mask_img,
 
     print("✔ Composite complete (Photoshop-style RGBA dilation).")
 
+def normalize_lightmap_for_png(img):
+    """
+    Rescale linear HDR lightmap so max RGB == 1.0
+    Preserves color ratios, PNG-safe.
+    """
+    w, h = img.size
+    arr = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+
+    rgb = arr[:, :, :3]
+
+    max_val = np.max(rgb)
+
+    if max_val > 1.0:
+        rgb /= max_val
+        arr[:, :, :3] = rgb
+
+    img.pixels[:] = arr.reshape(-1)
+    img.update()
+
+    return max_val  # keep this if you want to store scale
 
 def bake_lightmap_async(obj, lightmap_group, resolution=2048, callback=None):
     bake_queue.append((obj, lightmap_group, resolution, callback))
@@ -1151,10 +1299,13 @@ def rebuild_baked_mat_list():
 
                 if em_node.type == "TEX_IMAGE":
                     img = em_node.image
-                    filename = os.path.basename(img.filepath)
+                    try:
+                        filename = os.path.basename(img.filepath)
 
-                    if "lightmap_Lightgroup" in filename:
-                        baked_object.append(obj)
+                        if "lightmap_Lightgroup" in filename:
+                            baked_object.append(obj)
+                    except:
+                        pass
 
 def preview_init_check():
     rebuild_baked_mat_list()
@@ -1384,6 +1535,35 @@ class LGX_resolution(bpy.types.PropertyGroup):
         name="Resolution Value",
         default=1024
     )# type: ignore
+
+class LGX_render_light_level(bpy.types.PropertyGroup):
+
+    def update_light_level(self, context):
+        # Map enum → numeric light level
+        LEVEL_MAP = {
+            "LOW": 3.5,
+            "MEDIUM": 4.5,
+            "HIGH": 6.0,
+        }
+        self.value = LEVEL_MAP[self.mode]
+
+    mode: bpy.props.EnumProperty(
+        name="Render Light Level",
+        description="Maximum light level used for Map Range normalization",
+        items=[
+            ("LOW", "3.5", "Low (indoor / soft lighting)"),
+            ("MEDIUM", "4.5", "Medium (balanced lighting)"),
+            ("HIGH", "6.0", "High (bright / strong lights)"),
+        ],
+        default="LOW",   # 3.5 default
+        update=update_light_level,
+    )  # type: ignore
+
+    # Stores actual numeric light level
+    value: bpy.props.FloatProperty(
+        name="Light Level Value",
+        default=3.5
+    )  # type: ignore
 
 
 class LGX_UL_mylist(bpy.types.UIList):
@@ -1638,7 +1818,8 @@ class LGX_bake_lightmap(bpy.types.Operator):
             img.filepath_raw = path
             img.file_format = 'PNG'
             img.save()
-            print("Saved lightmap to:", path)
+            print(f"Saved lightmap to: {path}")
+            
 
         queue_group_bakes(
             scene.my_items,
@@ -1760,6 +1941,10 @@ class LGX_PT_panel(bpy.types.Panel):
         innerbox.label(text="Bake Samples")
         innerbox.prop(context.scene.lgx_bake_samples, "mode")
 
+        innerbox = box.box()
+        innerbox.label(text="Render Light Level")
+        innerbox.prop(context.scene.lgx_render_light_level, "mode")
+
         box.operator("lgx.bake", text="Bake Lightmap")
 
         row = box.row()
@@ -1808,6 +1993,7 @@ class LGX_PT_debug(bpy.types.Panel):
 
 
 classes = [
+    LGX_render_light_level,
     LGX_bake_samples,
     LGX_ensure_unique,
     LGX_remove_lightmaps,
@@ -1856,6 +2042,7 @@ def register():
     bpy.types.Scene.lgx_group_generator_count = bpy.props.PointerProperty(type=LGX_group_generator_count)
     bpy.types.Scene.lgx_render_resolution = bpy.props.PointerProperty(type=LGX_resolution)
     bpy.types.Scene.lgx_preview_props = bpy.props.PointerProperty(type=LGX_PreviewProps)
+    bpy.types.Scene.lgx_render_light_level = bpy.props.PointerProperty(type=LGX_render_light_level)
 
     preview_init_check()
 
@@ -1867,6 +2054,7 @@ def unregister():
     del bpy.types.Scene.lgx_group_generator_count
     del bpy.types.Scene.lgx_render_resolution
     del bpy.types.Scene.lgx_preview_props
+    del bpy.types.Scene.lgx_render_light_level
 
     for class_type in reversed(classes):
         bpy.utils.unregister_class(class_type)
