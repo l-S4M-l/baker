@@ -1623,6 +1623,17 @@ class LGX_OT_remove_item(bpy.types.Operator):
             scene.my_items_index = max(0, idx - 1)
         return {'FINISHED'}
 
+class LGX_OT_clear_items(bpy.types.Operator):
+    bl_idname = "lgx.ot_clear_items"
+    bl_label = "clearItems"
+
+    def execute(self, context):
+        scene = bpy.context.scene
+        scene.my_items.clear()
+        
+        return {"FINISHED"}
+
+
 class LGX_OT_select_items(bpy.types.Operator):
     bl_idname = "lgx.select_item"
     bl_label = "select items"
@@ -1904,6 +1915,7 @@ class LGX_PT_panel(bpy.types.Panel):
         box.operator("lgx.lightmap_groups_generator", icon="ZOOM_SELECTED", text="Generate Groups")
         box.prop(context.scene.lgx_group_generator_count, "count")
 
+        box.operator("lgx.ot_clear_items", icon="EVENT_MINUS", text="Clear Items")
 
         box.template_list(
             "LGX_UL_mylist",
@@ -1993,6 +2005,7 @@ class LGX_PT_debug(bpy.types.Panel):
 
 
 classes = [
+    LGX_OT_clear_items,
     LGX_render_light_level,
     LGX_bake_samples,
     LGX_ensure_unique,
